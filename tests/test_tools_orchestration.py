@@ -1,0 +1,406 @@
+import json
+import io
+import tempfile
+import threading
+import unittest
+from dataclasses import replace
+from datetime import datetime
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+from orion.config import Settings
+from orion.core.capabilities import CapabilityPolicy
+from orion.core.contracts import ChatMessage, ToolResult
+from orion.core.orchestrator import RequestOrchestrator
+from orion.core.policy import NetworkPolicyError
+from orion.tools.factory import create_default_tools
+from orion.tools.registry import ToolRegistry
+from orion.tools.system import SystemStatusTool
+from orion.tools.time import LocalTimeTool
+from orion.tools.weather import OpenMeteoWeatherTool
+from orion.tools.web_search import SearxngSearchTool
+from orion.memory.manager import MemoryManager
+from orion.reminders.manager import ReminderManager
+from orion.app import _LazyLocalModel, _run_request
+
+
+class ScriptedModel:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def complete(self, messages, *, max_tokens, timeout):
+        self.calls.append((tuple(messages), max_tokens, timeout))
+        return self.response
+
+
+class FakeTool:
+    def __init__(self, name, result):
+        self.name = name
+        self.result = result
+        self.calls = []
+
+    def execute(self, arguments, *, timeout, cancel_event):
+        self.calls.append((dict(arguments), timeout, cancel_event.is_set()))
+        return self.result
+
+
+class FakeFactualTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get_factual_json(self, url, *, params, allowed_hosts, timeout, policy):
+        self.calls.append((url, params, allowed_hosts, timeout))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class CapabilityPolicyTests(unittest.TestCase):
+    def test_rejects_broad_long_horizon_analysis(self):
+        assessment = CapabilityPolicy().assess(
+            "Analyze 10 years of global semiconductor trends and predict which company dominates the next five years."
+        )
+
+        self.assertFalse(assessment.supported)
+        self.assertEqual(assessment.reason, "broad_long_horizon_analysis")
+        self.assertIn("can't reliably", assessment.response)
+
+    def test_allows_narrow_comparison(self):
+        self.assertTrue(
+            CapabilityPolicy().assess("Compare these two benchmark results").supported
+        )
+
+
+class LocalToolTests(unittest.TestCase):
+    def test_time_tool_is_offline_and_timezone_aware(self):
+        settings = Settings()
+        fixed = datetime(2026, 9, 28, 13, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+        tool = LocalTimeTool(settings, clock=lambda zone: fixed.astimezone(zone))
+
+        result = tool.execute(
+            {"action": "time"}, timeout=1, cancel_event=threading.Event()
+        )
+
+        self.assertIn("01:05 PM IST", result.content)
+
+    def test_system_status_is_offline(self):
+        tool = SystemStatusTool()
+        result = tool.execute({}, timeout=1, cancel_event=threading.Event())
+
+        self.assertTrue(result.success)
+        self.assertIn("OS:", result.content)
+        self.assertIn("CPU cores:", result.content)
+
+    def test_local_tool_route_does_not_call_model(self):
+        model = ScriptedModel('{"type":"final","response":"unexpected"}')
+        time_tool = LocalTimeTool(
+            Settings(),
+            clock=lambda zone: datetime(2026, 9, 28, 13, 5, tzinfo=zone),
+        )
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([time_tool])
+        )
+
+        result = orchestrator.handle("What time is it?")
+
+        self.assertEqual(result.route.action, "time")
+        self.assertIn("01:05 PM IST", result.response)
+        self.assertEqual(model.calls, [])
+
+
+class FactualToolTests(unittest.TestCase):
+    def test_weather_geocodes_then_fetches_compact_data(self):
+        transport = FakeFactualTransport(
+            [
+                {
+                    "results": [
+                        {
+                            "name": "Pune",
+                            "admin1": "Maharashtra",
+                            "country": "India",
+                            "latitude": 18.52,
+                            "longitude": 73.85,
+                        }
+                    ]
+                },
+                {
+                    "timezone": "Asia/Kolkata",
+                    "current": {
+                        "time": "2026-09-28T12:00",
+                        "temperature_2m": 28.0,
+                        "weather_code": 1,
+                        "wind_speed_10m": 5.0,
+                    },
+                    "daily": {
+                        "time": ["2026-09-28"],
+                        "temperature_2m_max": [30.0],
+                        "temperature_2m_min": [22.0],
+                    },
+                },
+            ]
+        )
+        tool = OpenMeteoWeatherTool(Settings(), transport=transport)
+
+        result = tool.execute(
+            {"query": "What's the weather tomorrow in Pune?"},
+            timeout=8,
+            cancel_event=threading.Event(),
+        )
+
+        data = json.loads(result.content)
+        self.assertEqual(data["location"], "Pune, Maharashtra, India")
+        self.assertEqual(data["current"]["temperature_2m"], 28.0)
+        self.assertEqual(transport.calls[0][0], "https://geocoding-api.open-meteo.com/v1/search")
+        self.assertEqual(transport.calls[1][0], "https://api.open-meteo.com/v1/forecast")
+        self.assertEqual(transport.calls[1][1]["forecast_days"], 2)
+
+    def test_weather_requires_location_without_network_access(self):
+        transport = FakeFactualTransport([])
+        tool = OpenMeteoWeatherTool(Settings(), transport=transport)
+
+        result = tool.execute(
+            {"query": "What's the weather?"}, timeout=3, cancel_event=threading.Event()
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(transport.calls, [])
+
+    def test_search_fails_closed_when_not_configured(self):
+        transport = FakeFactualTransport([])
+        tool = SearxngSearchTool(Settings(), transport=transport)
+
+        result = tool.execute(
+            {"query": "search for local weather"},
+            timeout=3,
+            cancel_event=threading.Event(),
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("not configured", result.content)
+        self.assertEqual(transport.calls, [])
+
+    def test_search_compacts_results_and_limits_fields(self):
+        settings = replace(
+            Settings(),
+            searxng_base_url="https://search.example.test",
+            searxng_allowed_hosts=("search.example.test",),
+        )
+        transport = FakeFactualTransport(
+            [{"results": [{"title": "A result", "content": "Useful fact " * 100, "url": "https://source.test/item"}]}]
+        )
+        tool = SearxngSearchTool(settings, transport=transport, max_field_chars=50)
+
+        result = tool.execute(
+            {"query": "Search the web for current facts"},
+            timeout=3,
+            cancel_event=threading.Event(),
+        )
+
+        data = json.loads(result.content)
+        self.assertEqual(data["query"], "current facts")
+        self.assertLessEqual(len(data["results"][0]["snippet"]), 50)
+        self.assertEqual(transport.calls[0][2], {"search.example.test"})
+
+    def test_remote_and_unallowlisted_search_configuration_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "allowlisted HTTPS host"):
+            replace(
+                Settings(),
+                searxng_base_url="http://search.example.test",
+                searxng_allowed_hosts=("search.example.test",),
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "allowlisted HTTPS host"):
+            replace(
+                Settings(),
+                searxng_base_url="https://search.example.test",
+                searxng_allowed_hosts=("other.example.test",),
+            ).validate()
+
+    def test_transport_rejects_unallowlisted_url_before_network_call(self):
+        from orion.llm.runtime import LocalJsonTransport
+
+        class NeverOpen:
+            def open(self, *_args, **_kwargs):
+                raise AssertionError("network must not be called")
+
+        transport = LocalJsonTransport(opener=NeverOpen())
+        with self.assertRaises(NetworkPolicyError):
+            transport.get_factual_json(
+                "https://attacker.example/data",
+                params=None,
+                allowed_hosts={"api.weather.gov"},
+                timeout=1,
+            )
+
+
+class OrchestrationTests(unittest.TestCase):
+    def test_online_result_is_passed_to_local_model_not_cloud(self):
+        model = ScriptedModel(
+            json.dumps({"type": "final", "response": "Pune is 28 degrees."})
+        )
+        weather = FakeTool("weather", ToolResult('{"location":"Pune","temperature":28}'))
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([weather])
+        )
+
+        result = orchestrator.handle("What's the weather tomorrow in Pune?")
+
+        self.assertEqual(result.response, "Pune is 28 degrees.")
+        self.assertEqual(len(weather.calls), 1)
+        model_prompt = " ".join(m.content for m in model.calls[0][0])
+        self.assertIn('"temperature":28', model_prompt)
+        self.assertIn("Interpret only the supplied factual result", model_prompt)
+
+    def test_failed_online_lookup_does_not_invoke_model(self):
+        model = ScriptedModel('{"type":"final","response":"guess"}')
+        weather = FakeTool("weather", ToolResult("Weather lookup failed.", success=False))
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([weather])
+        )
+
+        result = orchestrator.handle("What's the weather tomorrow in Pune?")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(model.calls, [])
+
+    def test_capability_fallback_skips_factual_and_model_calls(self):
+        model = ScriptedModel('{"type":"final","response":"guess"}')
+        search = FakeTool("web_search", ToolResult("facts"))
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([search]))
+
+        result = orchestrator.handle(
+            "Analyze 10 years of global semiconductor trends and predict which company dominates the next five years."
+        )
+
+        self.assertFalse(result.completed)
+        self.assertIn("can't reliably", result.response)
+        self.assertEqual(search.calls, [])
+        self.assertEqual(model.calls, [])
+
+    def test_registry_contains_only_explicit_default_tool_names(self):
+        tools = create_default_tools(Settings())
+
+        self.assertEqual(
+            tools.names(),
+            ("system_status", "time", "weather", "web_search"),
+        )
+
+    def test_time_route_and_reminder_crud_do_not_call_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = ScriptedModel('{"type":"final","response":"unexpected"}')
+            memory = MemoryManager.from_settings(settings)
+            reminders = ReminderManager.from_settings(settings)
+            tools = create_default_tools(settings)
+            orchestrator = RequestOrchestrator(
+                settings, model, tools, memory=memory, reminders=reminders
+            )
+            try:
+                time_result = orchestrator.handle("What time is it?")
+                created = orchestrator.handle(
+                    "Remind me tomorrow at 1 PM about project meeting. Discuss API migration."
+                )
+                listed = orchestrator.handle("What reminders do I have today?")
+                tomorrow_list = orchestrator.handle("What reminders do I have for tmrw?")
+                missed = orchestrator.handle("Did I miss any reminders yet?")
+                time_follow_up = orchestrator.handle("at 2PM")
+                updated = orchestrator.handle(
+                    "Add notes to project meeting reminder: bring performance test results."
+                )
+                rescheduled = orchestrator.handle(
+                    "Reschedule my project meeting reminder to tomorrow at 3 PM"
+                )
+                cancelled = orchestrator.handle("Cancel my project meeting reminder")
+
+                self.assertIn("IST", time_result.response)
+                self.assertIn("Reminder set: project meeting", created.response)
+                self.assertIn("no pending reminders for today", listed.response)
+                self.assertIn("project meeting", tomorrow_list.response)
+                self.assertEqual(missed.response, "You have no overdue reminders.")
+                self.assertIn("one-shot request", time_follow_up.response)
+                self.assertEqual(updated.response, "Updated reminder: project meeting.")
+                self.assertEqual(rescheduled.response, "Updated reminder: project meeting.")
+                self.assertEqual(cancelled.response, "Reminder cancelled.")
+                self.assertEqual(model.calls, [])
+            finally:
+                memory.close()
+                reminders.close()
+
+    def test_typed_reminder_reschedule_and_notes_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = ScriptedModel('{"type":"final","response":"unexpected"}')
+            manager = ReminderManager.from_settings(settings)
+            tool_registry = create_default_tools(settings)
+            reminder = manager.create_from_request(
+                "Remind me tomorrow at 1 PM about project meeting",
+                now=datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata")),
+            )
+            orchestrator = RequestOrchestrator(
+                settings, model, tool_registry, reminders=manager
+            )
+            try:
+                updated = orchestrator.handle(
+                    "Reschedule my project meeting reminder to Friday at 3 PM"
+                )
+                noted = orchestrator.handle(
+                    "Add notes to the project meeting reminder: bring performance test results"
+                )
+
+                stored = manager.get(reminder.id)
+                self.assertEqual(updated.response, "Updated reminder: project meeting.")
+                self.assertEqual(stored.due_at.astimezone(ZoneInfo("Asia/Kolkata")).weekday(), 4)
+                self.assertEqual(stored.due_at.astimezone(ZoneInfo("Asia/Kolkata")).hour, 15)
+                self.assertIn("Updated reminder", noted.response)
+                self.assertEqual(stored.notes, "bring performance test results")
+                self.assertEqual(model.calls, [])
+            finally:
+                manager.close()
+
+    def test_ambiguous_reminder_cancel_requests_clarification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            manager = ReminderManager.from_settings(settings)
+            now = datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+            first = manager.create_from_request(
+                "Remind me tomorrow at 1 PM about project meeting", now=now
+            )
+            second = manager.create_from_request(
+                "Remind me tomorrow at 2 PM about project meeting review", now=now
+            )
+            orchestrator = RequestOrchestrator(
+                settings,
+                ScriptedModel('{"type":"final","response":"unexpected"}'),
+                create_default_tools(settings),
+                reminders=manager,
+            )
+            try:
+                result = orchestrator.handle("Cancel my project meeting reminder")
+                self.assertFalse(result.completed)
+                self.assertIn("several matching reminders", result.response)
+                self.assertEqual(manager.get(first.id).status.value, "pending")
+                self.assertEqual(manager.get(second.id).status.value, "pending")
+            finally:
+                manager.close()
+
+    def test_typed_cli_local_clock_request_does_not_load_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            output = io.StringIO()
+
+            with redirect_stdout(output), patch.object(
+                _LazyLocalModel,
+                "complete",
+                side_effect=AssertionError("model should stay unloaded"),
+            ):
+                _run_request(settings, "What time is it?")
+
+            self.assertIn("IST", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

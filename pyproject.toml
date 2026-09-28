@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orion-assistant"
+version = "0.1.0"
+description = "Privacy-first local voice assistant for Raspberry Pi"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+voice = [
+    "kittentts",
+    "sounddevice>=0.5.3",
+    "vosk>=0.3.45",
+]
+wakeword = ["numpy>=1.24", "openwakeword>=0.6.0"]
+pi = [
+    "gpiozero>=2.0.1",
+    "lgpio>=0.2.2.0",
+    "rpi-gpio>=0.7.1",
+]
+test = ["pytest>=8.0"]
+
+[tool.uv.sources]
+kittentts = { url = "https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl" }
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+orion = "orion.app:main"
