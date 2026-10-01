@@ -29,6 +29,8 @@ class AudioGate:
     def __init__(self) -> None:
         self._ready = threading.Event()
         self._ready.set()
+        self._interrupt = threading.Event()
+        self._lock = threading.Lock()
 
     def wait_until_open(self) -> None:
         self._ready.wait()
@@ -37,13 +39,24 @@ class AudioGate:
     def is_open(self) -> bool:
         return self._ready.is_set()
 
+    def request_interrupt(self) -> None:
+        with self._lock:
+            if not self._ready.is_set():
+                self._interrupt.set()
+
+    def wait_for_interrupt(self, timeout: float) -> bool:
+        return self._interrupt.wait(timeout)
+
     @contextmanager
     def speaking(self):
-        self._ready.clear()
+        with self._lock:
+            self._interrupt.clear()
+            self._ready.clear()
         try:
             yield
         finally:
-            self._ready.set()
+            with self._lock:
+                self._ready.set()
 
 
 class SoundDeviceChunkSource:
@@ -70,6 +83,7 @@ class SoundDeviceChunkSource:
             maxsize=self.settings.audio_queue_chunks
         )
         overflow = threading.Event()
+        external_stop_event = stop_event
         stop_event = stop_event or threading.Event()
 
         def callback(indata, _frames, _time, status) -> None:
@@ -93,7 +107,9 @@ class SoundDeviceChunkSource:
         )
         try:
             with stream:
-                while not stop_event.is_set():
+                while not stop_event.is_set() and not (
+                    external_stop_event is not None and external_stop_event.is_set()
+                ):
                     if overflow.is_set():
                         raise AudioBufferOverflow(
                             "Microphone chunk queue overflowed; utterance discarded"
@@ -111,4 +127,5 @@ class SoundDeviceChunkSource:
                     except queue.Empty:
                         continue
         finally:
-            stop_event.set()
+            if external_stop_event is None:
+                stop_event.set()

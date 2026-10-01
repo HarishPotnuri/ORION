@@ -26,6 +26,17 @@ class RouteDecision:
 
 
 class OrionRouter:
+    _multi_step_connectors = re.compile(r"\b(?:and then|then|also|after that|and)\b")
+    _operation_cues = (
+        re.compile(r"\b(?:search|look up|browse|check|find|show|list|tell|compare)\b"),
+        re.compile(r"\b(?:remind me|set|create|schedule)\b.{0,80}\breminders?\b|\bremind me\b"),
+        re.compile(r"\b(?:cancel|delete|remove)\b.{0,80}\breminders?\b|\breminders?\b.{0,50}\b(?:cancel|delete|remove)\b"),
+        re.compile(r"\b(?:reschedule|move|shift|change|modify|update)\b.{0,80}\breminders?\b|\breminders?\b.{0,50}\b(?:reschedule|move|shift|change|modify|update)\b"),
+        re.compile(r"\b(?:add|update|change|edit)\b.{0,40}\bnotes?\b"),
+        re.compile(r"\b(?:weather|forecast|news|latest|current)\b"),
+        re.compile(r"\b(?:remember|forget|save|delete memory)\b"),
+        re.compile(r"\b(?:time|date|day)\b"),
+    )
     _simple_commands = (
         (re.compile(r"\b(mute yourself|be quiet|stop speaking|silence)\b"), "mute_speaker"),
         (re.compile(r"\b(unmute yourself|resume speaking)\b"), "unmute_speaker"),
@@ -78,6 +89,9 @@ class OrionRouter:
         if not normalized:
             return RouteDecision(RouteKind.LLM_REASONING)
 
+        if self._is_multi_step(normalized):
+            return RouteDecision(RouteKind.LLM_REASONING, "multi_step")
+
         if self._incognito_on.search(normalized):
             return RouteDecision(RouteKind.INCOGNITO, "on")
         if self._incognito_off.search(normalized):
@@ -115,6 +129,16 @@ class OrionRouter:
             return RouteDecision(RouteKind.LOCAL_TOOL, "system_status")
 
         return RouteDecision(RouteKind.LLM_REASONING)
+
+    @classmethod
+    def _is_multi_step(cls, request: str) -> bool:
+        if not cls._multi_step_connectors.search(request):
+            return False
+        matching_operations = sum(
+            sum(1 for _match in pattern.finditer(request))
+            for pattern in cls._operation_cues
+        )
+        return matching_operations >= 2
 
     @staticmethod
     def _reminder_action(request: str) -> str:

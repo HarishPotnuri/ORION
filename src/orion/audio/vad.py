@@ -42,13 +42,25 @@ class VoiceActivityDetector:
         started = False
         silence_count = 0
         emitted = 0
+        observed = 0
 
         for chunk in chunks:
+            if observed >= self.max_chunks:
+                return
+            observed += 1
             if not started:
                 preroll.append(chunk)
                 if self._rms(chunk) < self.threshold:
+                    silence_count += 1
+                    if silence_count >= self.silence_chunks:
+                        return
                     continue
                 started = True
+                silence_count = 0
+                if not preroll:
+                    yield chunk
+                    emitted += 1
+                    continue
                 for buffered_chunk in preroll:
                     if emitted >= self.max_chunks:
                         return

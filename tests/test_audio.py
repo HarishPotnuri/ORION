@@ -1,11 +1,12 @@
 import array
+import threading
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from orion.audio.capture import AudioBufferOverflow, AudioGate, SoundDeviceChunkSource
-from orion.audio.stt import VoskTranscriber
+from orion.audio.stt import PushToTalkInput, VoskTranscriber
 from orion.audio.tts import KittenSpeechOutput
 from orion.audio.vad import VoiceActivityDetector
 from orion.audio.wakeword import OpenWakeWordDetector
@@ -60,6 +61,14 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(len(result), 3)
 
+    def test_vad_returns_after_silence_when_no_speech_starts(self):
+        detector = VoiceActivityDetector(
+            self.small_settings(vad_silence_ms=30, vad_preroll_ms=20)
+        )
+        silence = [pcm(0, 10)] * 10
+
+        self.assertEqual(list(detector.utterance_chunks(silence)), [])
+
     def test_vosk_transcribes_chunks_without_audio_files(self):
         with tempfile.TemporaryDirectory() as directory:
             model_path = Path(directory) / "model"
@@ -84,6 +93,31 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(transcript, "recognized words")
             self.assertEqual(len(recognizers[0].chunks), 5)
             self.assertEqual(list(model_path.iterdir()), [])
+
+    def test_push_to_talk_confirmation_timeout_does_not_stop_service(self):
+        service_stop = threading.Event()
+
+        class FakeButton:
+            is_pressed = False
+
+            def wait_for_press(self, timeout=None):
+                return None
+
+        class FakeSource:
+            def chunks(self, stop_event=None):
+                yield from ()
+
+        audio_input = PushToTalkInput(
+            self.small_settings(),
+            FakeButton(),
+            source=FakeSource(),
+            model_factory=lambda _path: object(),
+            recognizer_factory=FakeRecognizer,
+            stop_event=service_stop,
+        )
+
+        self.assertEqual(audio_input.next_utterance(timeout=0.01), "")
+        self.assertFalse(service_stop.is_set())
 
     def test_capture_overflow_discards_utterance(self):
         settings = self.small_settings(audio_queue_chunks=1)
@@ -150,6 +184,48 @@ class AudioTests(unittest.TestCase):
             speech.speak("test")
         gate.wait_until_open()
         self.assertEqual(played, [([0.1, -0.1], 24000)])
+
+    def test_tts_stops_playback_when_gate_receives_interrupt(self):
+        gate = AudioGate()
+        playback_done = threading.Event()
+        stopped = threading.Event()
+        playback_started = threading.Event()
+
+        class FakeTTS:
+            def __init__(self, _model_name):
+                pass
+
+            def generate(self, _text, *, voice):
+                return [0.1]
+
+        def wait_for_playback():
+            playback_done.wait(1)
+
+        def start_playback(*_args, **_kwargs):
+            playback_started.set()
+
+        def stop_playback():
+            stopped.set()
+            playback_done.set()
+
+        speech = KittenSpeechOutput(
+            self.small_settings(),
+            gate,
+            tts_factory=FakeTTS,
+            play=start_playback,
+            wait=wait_for_playback,
+            stop=stop_playback,
+        )
+        thread = threading.Thread(target=speech.speak, args=("test",))
+        thread.start()
+        self.assertTrue(playback_started.wait(1))
+        self.assertFalse(gate.is_open)
+        gate.request_interrupt()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(stopped.is_set())
+        self.assertTrue(gate.is_open)
 
 
 if __name__ == "__main__":

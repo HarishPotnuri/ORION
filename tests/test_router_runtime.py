@@ -68,6 +68,20 @@ class RouterTests(unittest.TestCase):
             "follow_up",
         )
 
+    def test_routes_combined_operations_to_bounded_planner(self):
+        requests = (
+            "Check the weather in Pune and set a reminder tomorrow at 8 AM to carry an umbrella",
+            "Find my project meeting reminder and move it to Friday",
+            "Reschedule my project meeting reminder to Friday and add notes: bring test results",
+            "Search recent news and tell me today's date",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.router.route(request).kind,
+                    RouteKind.LLM_REASONING,
+                )
+
     def test_routes_memory_and_online_requests(self):
         self.assertEqual(
             self.router.route("What did we decide about Orion's memory?").kind,

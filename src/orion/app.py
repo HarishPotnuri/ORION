@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 import time
 from collections.abc import Sequence
+from threading import Event
 
 from .config import Settings
 from .logging_config import configure_logging
@@ -24,6 +26,37 @@ from .tools.factory import create_default_tools
 logger = logging.getLogger(__name__)
 
 
+class _StatusSpeechOutput:
+    def __init__(self, speech_output, set_status):
+        self.speech_output = speech_output
+        self.set_status = set_status
+
+    def speak(self, text: str) -> None:
+        self.set_status("SPEAKING")
+        try:
+            self.speech_output.speak(text)
+        finally:
+            self.set_status("IDLE")
+
+
+def _confirm_spoken_action(prompt: str, audio_input, speech_output) -> bool:
+    speech_output.speak(prompt)
+    answer = audio_input.next_utterance(timeout=15.0).strip().casefold().strip(" .!?\t")
+    return answer in {"yes", "yes confirm", "confirm", "do it"}
+
+
+def _set_led_status(led, status: str) -> None:
+    brightness = {
+        "IDLE": 0.0,
+        "LISTENING": 0.2,
+        "PROCESSING": 0.45,
+        "SPEAKING": 0.7,
+        "MUTED": 0.05,
+        "ERROR": 1.0,
+    }.get(status, 0.0)
+    led.value = brightness
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="orion")
     parser.add_argument(
@@ -35,6 +68,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--voice-check",
         action="store_true",
         help="transcribe one utterance and verify local speech output",
+    )
+    parser.add_argument(
+        "--run-voice",
+        action="store_true",
+        help="run the continuous local voice assistant and reminder scheduler",
     )
     parser.add_argument(
         "--route",
@@ -72,6 +110,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, RuntimeError, ValueError) as error:
             logger.error("Voice check failed: %s", error)
             return 1
+    elif args.run_voice:
+        try:
+            _run_voice_service(settings)
+        except (OSError, RuntimeError, ValueError) as error:
+            logger.error("Voice service failed: %s", error)
+            return 1
     elif args.run_reminders:
         try:
             _run_reminder_service(settings)
@@ -89,31 +133,171 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _run_voice_check(settings: Settings) -> None:
+def _create_audio_input(settings: Settings, gate: AudioGate, stop_event: Event):
     try:
         from gpiozero import Button
     except ImportError as error:
-        raise RuntimeError("gpiozero is required for push-to-talk input") from error
+        raise RuntimeError("gpiozero is required for voice input") from error
 
-    gate = AudioGate()
     if settings.wake_word_enabled:
         detector = OpenWakeWordDetector(
             settings.wake_word, settings.wake_word_threshold
         )
-        audio_input = WakeWordInput(settings, detector, gate=gate)
         logger.info("Waiting for wake word '%s'", settings.wake_word)
-    else:
-        button = Button(settings.push_to_talk_pin)
-        audio_input = PushToTalkInput(settings, button, gate=gate)
-        logger.info("Press GPIO %d to speak", settings.push_to_talk_pin)
+        return WakeWordInput(settings, detector, gate=gate, stop_event=stop_event), None
+    button = Button(settings.push_to_talk_pin)
+    logger.info("Press GPIO %d to speak", settings.push_to_talk_pin)
+    return PushToTalkInput(settings, button, gate=gate, stop_event=stop_event), button
+
+
+def _run_voice_check(settings: Settings) -> None:
+    gate = AudioGate()
+    stop_event = Event()
+    audio_input, button = _create_audio_input(settings, gate, stop_event)
 
     speech_output = KittenSpeechOutput(settings, gate)
-    transcript = audio_input.next_utterance()
-    if not transcript:
-        logger.info("No speech detected")
-        return
-    logger.info("Transcript: %s", transcript)
-    speech_output.speak("Local voice pipeline is ready.")
+    try:
+        transcript = audio_input.next_utterance()
+        if not transcript:
+            logger.info("No speech detected")
+            return
+        logger.info("Transcript: %s", transcript)
+        speech_output.speak("Local voice pipeline is ready.")
+    finally:
+        stop_event.set()
+        if button is not None:
+            button.close()
+
+
+def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_event, set_status):
+    try:
+        scheduler.start()
+        logger.info("Voice assistant started")
+        while not stop_event.is_set():
+            try:
+                set_status("LISTENING")
+                transcript = audio_input.next_utterance()
+                if stop_event.is_set():
+                    break
+                if not transcript.strip():
+                    speech_output.speak("I didn't catch that. Please try again.")
+                    continue
+                logger.info("Transcript received (%d characters)", len(transcript))
+                set_status("PROCESSING")
+                result = orchestrator.handle(transcript)
+                set_status("SPEAKING")
+                speech_output.speak(result.response)
+            except Exception as error:
+                logger.warning("Voice turn failed (%s)", type(error).__name__)
+                set_status("ERROR")
+                if not stop_event.is_set():
+                    try:
+                        speech_output.speak(
+                            "I couldn't process that turn. Please try again."
+                        )
+                    except Exception as speech_error:
+                        logger.warning(
+                            "Voice error feedback failed (%s)",
+                            type(speech_error).__name__,
+                        )
+                if not stop_event.wait(0.5):
+                    set_status("LISTENING")
+    finally:
+        stop_event.set()
+        try:
+            scheduler.stop()
+        finally:
+            set_status("IDLE")
+
+
+def _run_voice_service(settings: Settings) -> None:
+    try:
+        from gpiozero import PWMLED
+    except ImportError as error:
+        raise RuntimeError("gpiozero is required for voice status LED output") from error
+
+    stop_event = Event()
+    old_sigint = signal.getsignal(signal.SIGINT)
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+    gate = AudioGate()
+    led = None
+    audio_input = button = interrupt_button = None
+    model = memory = reminders = scheduler = speech_output = None
+
+    def set_status(status: str) -> None:
+        if led is not None:
+            _set_led_status(led, status)
+
+    def speak(text: str) -> None:
+        speech_output.speak(text)
+
+    try:
+        led = PWMLED(settings.status_led_pin)
+        model = _LazyLocalModel(settings)
+        memory = MemoryManager.from_settings(settings)
+        reminders = ReminderManager.from_settings(settings)
+        speech_output = _StatusSpeechOutput(
+            KittenSpeechOutput(settings, gate), set_status
+        )
+        scheduler = ReminderScheduler(
+            reminders.store,
+            ReminderNotifier(speak, set_status),
+            poll_interval=settings.reminder_poll_interval,
+        )
+
+        def stop_service(_signum, _frame) -> None:
+            stop_event.set()
+            gate.request_interrupt()
+
+        signal.signal(signal.SIGINT, stop_service)
+        signal.signal(signal.SIGTERM, stop_service)
+        audio_input, button = _create_audio_input(settings, gate, stop_event)
+
+        if button is None:
+            try:
+                from gpiozero import Button
+            except ImportError as error:
+                raise RuntimeError("gpiozero is required for voice interruption") from error
+            interrupt_button = Button(settings.push_to_talk_pin)
+        else:
+            interrupt_button = button
+        interrupt_button.when_pressed = gate.request_interrupt
+
+        def confirm_spoken(prompt: str) -> bool:
+            return _confirm_spoken_action(prompt, audio_input, speech_output)
+
+        orchestrator = RequestOrchestrator(
+            settings,
+            model,
+            create_default_tools(settings),
+            memory=memory,
+            reminders=reminders,
+            confirm_action=confirm_spoken,
+        )
+        _run_voice_loop(
+            audio_input, orchestrator, speech_output, scheduler, stop_event, set_status
+        )
+    finally:
+        stop_event.set()
+        if audio_input is not None:
+            audio_input.stop_event.set()
+        cleanup_actions = (
+            ("scheduler", scheduler.stop if scheduler is not None else None),
+            ("model", model.close if model is not None else None),
+            ("memory", memory.close if memory is not None else None),
+            ("reminders", reminders.close if reminders is not None else None),
+            ("interrupt button", interrupt_button.close if interrupt_button is not None else None),
+            ("status LED", led.close if led is not None else None),
+            ("SIGINT handler", lambda: signal.signal(signal.SIGINT, old_sigint)),
+            ("SIGTERM handler", lambda: signal.signal(signal.SIGTERM, old_sigterm)),
+        )
+        for name, cleanup in cleanup_actions:
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except Exception as error:
+                logger.warning("Could not clean up %s (%s)", name, type(error).__name__)
 
 
 def _run_reminder_service(settings: Settings) -> None:

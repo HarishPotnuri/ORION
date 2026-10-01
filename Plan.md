@@ -4,7 +4,7 @@
 
 Build ORION as a privacy-first, local-first personal voice assistant for Raspberry Pi 5 with 8 GB RAM. The product should provide reliable push-to-talk interaction, local speech recognition, local model reasoning, local speech output, persistent reminders, and user-controlled memory.
 
-The architecture foundation and features through Phase 7 are implemented in the repository. The remaining work is to turn those modules into a Pi-validated product: first connect the voice path, then verify deployment and behavior on the target hardware, measure resource use, and only then decide whether further agent planning is warranted.
+The architecture foundation and voice-service integration are implemented in the repository. Remaining work is target validation: verify deployment and behavior on the Raspberry Pi, measure resource use, then decide whether further agent planning is warranted.
 
 ## Product and Engineering Principles
 
@@ -15,11 +15,13 @@ The architecture foundation and features through Phase 7 are implemented in the 
 - Bound audio queues, utterance length, model context, agent steps, tool time, and task time.
 - Prefer one simple, long-running ORION service for voice interaction and reminder delivery; avoid unnecessary background services.
 - Report hardware and performance support only for configurations actually verified on a Raspberry Pi.
-- Do not expand agent planning until the end-to-end voice path works and its Pi resource use is measured.
+- Use deterministic fast paths only for clear, complete actions. Send compound or incomplete requests to the bounded local planner.
+- Keep all tool authorization, input validation, side effects, and online-data boundaries in deterministic code.
+- Keep planner scope narrow. Add tool actions only when they solve a demonstrated user request.
 
 ## Current Status (September 2026)
 
-Phases 1 through 7 are implemented in code. Typed CLI requests and the module-level tests provide a useful development path. The repository does not yet connect live audio capture to `RequestOrchestrator` in a continuous assistant loop, and Pi installation, audio/GPIO behavior, performance, and thermal behavior remain unverified.
+Phases 1 through 8 are implemented in code. Typed CLI requests and the module-level tests provide a useful development path. Pi installation, audio/GPIO behavior, performance, and thermal behavior remain unverified.
 
 Status terms in this plan:
 
@@ -131,29 +133,34 @@ Adapt module boundaries when needed, but do not add empty modules or abstraction
 - Capability policy refuses selected broad, long-horizon analysis with an honest narrower alternative.
 - Live provider availability and Pi networking have not been validated. Keep online lookup failures bounded and clear to the user.
 
-## Remaining Work
+### Phase 8: End-to-End Voice Assistant — Implemented; Pi Verification Pending
 
-### Phase 8: End-to-End Push-to-Talk Assistant — Next Priority
-
-Connect the existing adapters and services into one usable voice interaction. Start with push-to-talk; do not make wake-word operation a prerequisite.
+Connect the existing adapters and services into one persistent voice interaction. Push-to-talk is the default; wake-word input is optional and selected through `ORION_WAKE_WORD_ENABLED`.
 
 1. Add a long-running assistant lifecycle that waits for push-to-talk, captures and transcribes one utterance, passes the transcript to `RequestOrchestrator`, and speaks the final response through `KittenSpeechOutput`.
 2. Keep the process alive across turns so the configured model, STT model, TTS engine, SQLite stores, and volatile conversation context can be reused instead of reloaded for every turn.
 3. Preserve deterministic fast paths: simple commands, local tools, reminder actions, and memory actions must not initialize or call the LLM unless their defined handling requires it.
 4. Route typed and spoken requests through the same orchestration logic. Keep the typed CLI available for diagnostics and laptop development.
 5. Set explicit hardware status transitions for idle, listening, processing, speaking, muted, and error where supported by the connected hardware. Make cleanup reliable on normal exit, exceptions, and SIGTERM.
-6. Handle empty/unclear transcripts, audio overflow, missing devices, STT/model/TTS errors, and user interruption without corrupting reminder or memory state. Give concise user-facing error feedback where speech remains available.
-7. Keep microphone capture disabled during speech playback. Ensure audio streams, button callbacks, worker threads, GPIO devices, model processes, and database connections close on shutdown.
-8. Add fake-based integration tests for the complete turn lifecycle, ensuring audio → transcript → orchestrator → response → speech ordering and testing failures/cleanup.
-9. Do not add wake-word inference, a second router model, or multi-agent behavior in this phase.
+6. Handle empty/unclear transcripts, audio overflow, missing devices, STT/model/TTS errors, and user interruption without corrupting reminder or memory state. Retry a failed local model call once, then speak a concise error and return to listening.
+7. Support barge-in during TTS through the configured push-to-talk button: stop playback on button press, then capture while the button remains pressed. In wake-word mode, button press stops playback and the next turn still requires the configured wake word. Keep microphone capture gated during playback. Ensure audio streams, button callbacks, worker threads, GPIO devices, model processes, and database connections close on shutdown.
+8. Require spoken confirmation before cancelling a reminder or deleting a saved memory. Repeat the selected target, accept only a clear affirmative response within 15 seconds, and make no change on rejection, timeout, or unclear speech.
+9. Add fake-based integration tests for the complete turn lifecycle, ensuring audio → transcript → orchestrator → response → speech ordering and testing interruption, confirmation, retry, failures, and cleanup.
+10. Do not add a second routing model or multi-agent behavior in this phase.
 
 Acceptance criteria:
 
-- A simulated push-to-talk turn transcribes once, dispatches once, speaks once, and releases resources after shutdown.
+- A simulated push-to-talk turn transcribes once, dispatches once, speaks once, supports barge-in, and releases resources after shutdown.
 - A local deterministic command does not initialize the LLM.
 - Audio overflow or an adapter failure discards the affected utterance and does not leave capture or playback stuck.
+- Reminder cancellation and memory deletion require clear spoken confirmation within 15 seconds; unclear, rejected, or timed-out confirmation causes no mutation.
+- A failed local model call is retried once; a second failure produces a short spoken error and returns the assistant to listening.
 - The application can run multiple turns in one process without unbounded audio or conversation growth.
 - Incognito, memory retrieval, reminder operations, and reminder delivery preserve their current persistence/privacy rules in the long-running process.
+
+Implementation status: `orion --run-voice` runs repeated turns through shared audio input, orchestration, local speech output, and reminder scheduling. The service reuses model and SQLite managers across turns; Incognito resets on restart. Push-to-talk remains default; optional openWakeWord consumes its activation chunk before transcription. Push-to-talk interrupts TTS; reminder cancellation and episode deletion require a clear spoken confirmation in voice mode. The agent retries one failed or malformed model response within the task deadline. Error feedback, PWM LED states, signal handling, and cleanup have fake-based local tests. Raspberry Pi installation, real audio/GPIO behavior, acoustics, performance, and sustained operation remain unverified.
+
+## Remaining Work
 
 ### Phase 9: Raspberry Pi Installation and Compatibility Gate
 
@@ -211,17 +218,21 @@ Acceptance criteria:
 - Repeated voice interactions complete without unbounded memory growth, stuck audio, model crashes, or missed reminder delivery.
 - Model/backend choice is supported by recorded Pi measurements; unverified alternatives remain labeled unverified.
 
-### Phase 12: Focused Product Improvements — Only After Pi Baseline
+### Phase 12: Bounded Hybrid Routing and Tool Planning — Initial Slice Implemented
 
-Revisit planned agent and interaction enhancements only where Pi use reveals a concrete need.
+Use deterministic code for recognizable, complete commands. Use the local model as planner for compound requests and for supported operations that lack required details. The model selects registered tools; deterministic adapters validate every argument and perform every side effect.
 
-1. Review route misses, clarification failures, reminder parsing errors, tool failures, and structured-output failures from actual use.
-2. Keep deterministic fast paths for unambiguous local commands and stateful CRUD. Improve normalization and clarification behavior with regression tests.
-3. If complex multi-tool requests are needed, expose only narrow typed operations through registered tools. Validate all arguments and authorize every side effect in deterministic code.
-4. Add model planning incrementally, with step/time limits, repeated-action protection, per-tool authorization, failure recovery, and explicit confirmation for consequential actions.
-5. Do not let model output directly mutate SQLite records, GPIO state, or reminder schedules.
-6. Add a multi-turn clarification flow only if the persistent interaction lifecycle can preserve bounded volatile state correctly. One-shot CLI requests must not claim context they do not have.
-7. Do not add embeddings, external agent frameworks, a second routing LLM, or broad plugin systems without measured need.
+1. Keep complete local time/status, simple weather/search, memory commands, and unambiguous reminder operations on existing deterministic routes.
+2. Detect compound requests with action cues and connectors, then route them to the existing bounded local agent. This is a conservative recognizer, not a confidence score from a second model.
+3. Send incomplete reminder creation/reschedule requests to the agent so it can ask for missing information instead of returning parser errors or guessing.
+4. Expose one typed `reminder` tool with list, find, create, reschedule, add-notes, and cancel actions. Tool code checks user intent, validates fields, requires title/time/query/notes to be grounded in the user request, and refuses ambiguous targets.
+5. Let the planner choose only relevant tools based on request cues. Bind agent-selected weather/search queries to text from the user request; preserve HTTPS allowlists and provider boundaries.
+6. Preserve agent maximum steps, total deadline, per-tool timeout, repeated-action protection, context limits, and failure recovery. Require explicit user intent for reminder mutations; ask for clarification when selection is ambiguous.
+7. Keep one-shot requests stateless. Do not claim earlier details are known when the current process has no such context.
+8. Add regression tests for deterministic bypass, compound tool sequences, incomplete reminders, invalid/unrequested actions, query grounding, ambiguity, and privacy/local-only guarantees.
+9. After the initial slice, use real request failures and Pi measurements to decide which additional routes/tools are worth adding. Do not add embeddings, external agent frameworks, a second routing LLM, or broad plugin systems without measured need.
+
+Implementation status: The router sends recognized compound requests to the bounded agent. Simple complete commands retain deterministic fast paths. Incomplete reminder creation/reschedule falls back to local clarification/planning. The agent can sequence allowed weather/search/local tools with the request-scoped reminder tool. Reminder mutations require explicit matching user intent; reminder fields and factual lookup queries are checked against the original request. Tests cover weather-plus-reminder planning, incomplete reminders, rejected unrequested actions, grounded factual queries, and existing fast-path regressions. Initial operation-cue detection is intentionally conservative and may miss natural-language combinations; broaden it only with regression examples. Multi-step memory tools, calendar/device actions, and model-originated irreversible actions remain out of scope.
 
 Acceptance criteria:
 
@@ -283,7 +294,7 @@ Use resource-conscious defaults, but label RAM and latency expectations as estim
 
 ## Known Limits
 
-- End-to-end continuous voice interaction is not connected to the orchestrator yet.
+- End-to-end voice flow is implemented but not verified with microphone, speaker, and GPIO hardware.
 - The Pi installation and the compatibility of the pinned Python/dependency set on the target OS are unverified.
 - Audio hardware, VOSK/TTS coexistence, GPIO behavior, wake-word behavior, CPU, memory, thermal, latency, and long-running stability have not been measured on the Pi.
 - The current README includes older setup/model guidance and must be reconciled with the verified packaged runtime before release.
@@ -294,6 +305,6 @@ Use resource-conscious defaults, but label RAM and latency expectations as estim
 
 ## Immediate Milestone and Handoff
 
-The next milestone is Phase 8: connect push-to-talk capture and transcription to `RequestOrchestrator`, then speak the response in one persistent process, with a testable lifecycle and error cleanup. Do not start by expanding the planner. After the fake-based integration path is sound, proceed through the clean Pi compatibility gate, integrated service/deployment, and measured validation.
+Phase 8 and the initial Phase 12 planner slice are implemented in code and covered by local tests. Next milestone is Phase 9: install the documented stack on a clean Raspberry Pi OS image and close dependency/runtime compatibility gaps. Then complete deployment and measured validation. Expand planner tools only for concrete, tested user needs and retain execution safeguards.
 
 For an implementation agent, work phase by phase. Before editing, inspect the current code and tests; implement only the active phase, add or update focused tests, run the relevant local checks, and report which acceptance criteria passed. Do not mark Pi-specific criteria complete from laptop results. Preserve uncommitted user changes and do not make unrelated cleanup changes.

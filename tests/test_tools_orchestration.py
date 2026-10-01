@@ -36,6 +36,16 @@ class ScriptedModel:
         return self.response
 
 
+class PlanningModel:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def complete(self, messages, *, max_tokens, timeout):
+        self.calls.append((tuple(messages), max_tokens, timeout))
+        return self.responses.pop(0)
+
+
 class FakeTool:
     def __init__(self, name, result):
         self.name = name
@@ -238,6 +248,86 @@ class FactualToolTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_planner_can_combine_weather_and_reminder_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = PlanningModel(
+                json.dumps({
+                    "type": "tool",
+                    "name": "weather",
+                    "arguments": {"query": "weather in Pune"},
+                }),
+                json.dumps({
+                    "type": "tool",
+                    "name": "reminder",
+                    "arguments": {
+                        "action": "create",
+                        "title": "carry an umbrella",
+                        "when": "tomorrow at 8 AM",
+                    },
+                }),
+                json.dumps({"type": "final", "response": "Rain is expected. I set your umbrella reminder."}),
+            )
+            weather = FakeTool("weather", ToolResult('{"forecast":"rain"}'))
+            reminders = ReminderManager.from_settings(settings)
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([weather]), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle(
+                    "Check the weather in Pune and set a reminder tomorrow at 8 AM to carry an umbrella"
+                )
+
+                self.assertEqual(result.route.kind.value, "LLM_REASONING")
+                self.assertIn("set your umbrella reminder", result.response)
+                self.assertEqual(len(weather.calls), 1)
+                saved = reminders.list(status="pending")
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(saved[0].title, "carry an umbrella")
+                self.assertEqual(len(model.calls), 3)
+            finally:
+                reminders.close()
+
+    def test_incomplete_reminder_uses_model_to_ask_for_required_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = ScriptedModel(
+                json.dumps({"type": "final", "response": "What time should I set the reminder for?"})
+            )
+            reminders = ReminderManager.from_settings(settings)
+            orchestrator = RequestOrchestrator(
+                settings, model, create_default_tools(settings), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle("Remind me to call the dentist")
+
+                self.assertEqual(len(model.calls), 1)
+                self.assertIn("What time", result.response)
+                self.assertEqual(reminders.list(status="pending"), [])
+            finally:
+                reminders.close()
+
+    def test_agent_factual_query_cannot_expand_beyond_user_request(self):
+        model = PlanningModel(
+            json.dumps({
+                "type": "tool",
+                "name": "weather",
+                "arguments": {"query": "weather in London"},
+            }),
+            json.dumps({"type": "final", "response": "I could not look up that location."}),
+        )
+        weather = FakeTool("weather", ToolResult("should not be called"))
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([weather]))
+
+        result = orchestrator.handle(
+            "Check the weather in Pune and tell me today's date"
+        )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(weather.calls, [])
+        observation = " ".join(message.content for message in model.calls[1][0])
+        self.assertIn("must come from the user's request", observation)
+
     def test_online_result_is_passed_to_local_model_not_cloud(self):
         model = ScriptedModel(
             json.dumps({"type": "final", "response": "Pune is 28 degrees."})
@@ -326,6 +416,47 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertEqual(rescheduled.response, "Updated reminder: project meeting.")
                 self.assertEqual(cancelled.response, "Reminder cancelled.")
                 self.assertEqual(model.calls, [])
+            finally:
+                memory.close()
+                reminders.close()
+
+    def test_voice_confirmation_guards_reminder_cancel_and_memory_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            memory = MemoryManager.from_settings(settings)
+            reminders = ReminderManager.from_settings(settings)
+            memory.save_episode(
+                "We chose SQLite for the launch decision.",
+                topic="launch decision",
+                explicitly_requested=True,
+            )
+            reminder = reminders.create_from_request(
+                "Remind me tomorrow at 1 PM about project meeting",
+                now=datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata")),
+            )
+            answers = iter([False, False, True, True])
+            prompts = []
+            orchestrator = RequestOrchestrator(
+                settings,
+                ScriptedModel('{"type":"final","response":"unexpected"}'),
+                create_default_tools(settings),
+                memory=memory,
+                reminders=reminders,
+                confirm_action=lambda prompt: prompts.append(prompt) or next(answers),
+            )
+            try:
+                denied_cancel = orchestrator.handle("Cancel my project meeting reminder")
+                denied_delete = orchestrator.handle("Forget what we discussed about launch decision")
+                confirmed_cancel = orchestrator.handle("Cancel my project meeting reminder")
+                confirmed_delete = orchestrator.handle("Forget what we discussed about launch decision")
+
+                self.assertFalse(denied_cancel.completed)
+                self.assertFalse(denied_delete.completed)
+                self.assertEqual(reminders.get(reminder.id).status.value, "cancelled")
+                self.assertIn("I deleted", confirmed_delete.response)
+                self.assertTrue(any("project meeting" in prompt for prompt in prompts))
+                self.assertTrue(any("SQLite" in prompt for prompt in prompts))
+                self.assertEqual(memory.list_memories(kind="episode"), [])
             finally:
                 memory.close()
                 reminders.close()

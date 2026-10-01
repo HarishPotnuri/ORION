@@ -33,7 +33,11 @@ $env:ORION_DATABASE_PATH = Join-Path $env:TEMP "orion-local-test.sqlite3"
 
 Simple commands, memory, and reminders run without an LLM. Reasoning needs one local model service. The default backend is llama.cpp at `127.0.0.1:8080`; Ollama can be selected with `ORION_MODEL_BACKEND=ollama` and its local endpoint. Weather needs internet access. Web search stays disabled until you configure an HTTPS SearXNG instance and its exact allowed host.
 
-This profile does not test live microphone capture, GPIO, wake-word inference, or Pi resource use. The continuous microphone-to-orchestrator loop is not connected yet. Raspberry Pi audio and GPIO dependencies are available as opt-in package extras.
+The continuous voice service connects microphone input, transcription, request handling, local speech output, and reminder delivery in one persistent process. Run `orion --run-voice` on the Raspberry Pi after installing the `voice` and `pi` extras and configuring the local model. This profile does not test live microphone capture, GPIO, wake-word inference, or Pi resource use. Those features still need validation on the target hardware. Raspberry Pi audio and GPIO dependencies remain opt-in package extras.
+
+Push-to-talk on GPIO 23 is the default voice input. Set `ORION_WAKE_WORD_ENABLED=true` and install the `wakeword` extra to use the configured wake word instead. Wake-word mode remains disabled by default. The voice service runs the reminder scheduler in the same process; use `orion --run-reminders` only when operating the scheduler without voice interaction.
+
+During push-to-talk speech playback, press and hold the button to interrupt output and begin a new capture. In wake-word mode, the button stops playback; say the configured wake word to start the next capture. ORION asks for spoken confirmation before cancelling a reminder or deleting a saved episode. Confirmation expires after 15 seconds. A failed or malformed local-model response is retried once; a second failure produces a short spoken error.
 
 Run the repeatable local test and typed-request smoke checks with:
 
@@ -59,6 +63,8 @@ ORION typed requests run deterministic local tools without loading the local mod
 orion --request "What time is it?"
 orion --request "Remind me tomorrow at 1 PM about the project meeting"
 ```
+
+Clear, complete commands use deterministic fast paths. Compound requests can use the configured local model as a bounded planner over approved tools. For example, a weather request combined with a reminder can look up the forecast, then create a reminder. ORION validates reminder actions and request-derived details before changing stored reminders. Complex planning needs a working local model; missing or ambiguous details should trigger clarification.
 
 Weather uses the Open-Meteo geocoding and forecast APIs. SearXNG search stays disabled until you configure a trusted HTTPS instance and its exact hostname:
 

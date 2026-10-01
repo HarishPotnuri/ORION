@@ -188,13 +188,21 @@ class MemoryManager:
     def delete_episode_by_query(
         self, query: str, *, limit: int = 10
     ) -> EpisodeDeleteResult:
+        result = self.find_episode_by_query(query, limit=limit)
+        if result.status != "found":
+            return result
+        deleted = self.store.delete_episode(result.matches[0].id)
+        return EpisodeDeleteResult("deleted" if deleted else "not_found", result.matches)
+
+    def find_episode_by_query(
+        self, query: str, *, limit: int = 10
+    ) -> EpisodeDeleteResult:
         matches = tuple(self.store.search(query, kind="episode", limit=limit))
         if not matches:
             return EpisodeDeleteResult("not_found")
         if len(matches) > 1:
             return EpisodeDeleteResult("ambiguous", matches)
-        deleted = self.store.delete_episode(matches[0].id)
-        return EpisodeDeleteResult("deleted" if deleted else "not_found", matches)
+        return EpisodeDeleteResult("found", matches)
 
     def close(self) -> None:
         self.conversation.clear()

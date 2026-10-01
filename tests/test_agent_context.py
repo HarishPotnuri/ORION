@@ -277,6 +277,24 @@ class AgentControllerTests(unittest.TestCase):
         self.assertEqual(result.reason, "model_timeout")
         self.assertLess(time.monotonic() - started, 0.08)
 
+    def test_retries_transient_model_failure_once(self):
+        model = ScriptedModel(RuntimeError("temporary model failure"), final("Recovered."))
+
+        result = self.controller(model).run("Answer this")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.response, "Recovered.")
+        self.assertEqual(len(model.calls), 2)
+
+    def test_retries_malformed_model_decision_once(self):
+        model = ScriptedModel("not JSON", final("Recovered."))
+
+        result = self.controller(model).run("Answer this")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.response, "Recovered.")
+        self.assertEqual(len(model.calls), 2)
+
     def test_invalid_model_decision_returns_safe_fallback(self):
         model = ScriptedModel("I think the answer is 42")
 

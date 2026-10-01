@@ -103,22 +103,41 @@ class AgentController:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return self._limit_result(step - 1, "task_timeout")
-            try:
-                raw_response = self._worker(
-                    lambda: self.model.complete(
-                        context.messages,
-                        max_tokens=min(512, self.settings.max_context_tokens),
-                        timeout=remaining,
-                    ),
-                    remaining,
-                )
-            except TimeoutError:
-                return self._limit_result(step - 1, "model_timeout")
-            except Exception as error:
-                logger.warning("Local model call failed (%s)", type(error).__name__)
-                return self._limit_result(step - 1, "model_error")
+            decision = None
+            invalid_response = False
+            for attempt in range(2):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return self._limit_result(step - 1, "task_timeout")
+                try:
+                    raw_response = self._worker(
+                        lambda: self.model.complete(
+                            context.messages,
+                            max_tokens=min(512, self.settings.max_context_tokens),
+                            timeout=remaining,
+                        ),
+                        remaining,
+                    )
+                except TimeoutError:
+                    return self._limit_result(step - 1, "model_timeout")
+                except Exception as error:
+                    logger.warning(
+                        "Local model call failed (%s), attempt %d of 2",
+                        type(error).__name__,
+                        attempt + 1,
+                    )
+                    if attempt == 0 and self._clock() < deadline:
+                        continue
+                    if invalid_response:
+                        return self._limit_result(step, "invalid_model_response")
+                    return self._limit_result(step - 1, "model_error")
 
-            decision = self._parse_decision(raw_response)
+                decision = self._parse_decision(raw_response)
+                if decision is not None:
+                    break
+                invalid_response = True
+                if attempt == 0:
+                    logger.warning("Local model returned an invalid decision; retrying once")
             if decision is None:
                 return self._limit_result(step, "invalid_model_response")
             if decision["type"] == "final":

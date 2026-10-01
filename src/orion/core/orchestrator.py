@@ -14,6 +14,7 @@ from ..memory.manager import EpisodeDeleteResult, MemoryManager
 from ..memory.policy import MemorySaveStatus
 from ..reminders.manager import ReminderManager
 from ..reminders.models import Reminder
+from ..reminders.tool import ReminderTool
 from ..tools.registry import ToolRegistry
 from .agent import AgentController
 from .capabilities import CapabilityPolicy
@@ -29,6 +30,28 @@ class RequestResult:
     completed: bool
 
 
+class _RequestBoundFactualTool:
+    """Keep agent-selected online queries inside the user's explicit request."""
+
+    def __init__(self, tool, request: str):
+        self._tool = tool
+        self.name = tool.name
+        self.description = tool.description if hasattr(tool, "description") else ""
+        self._request = " ".join(request.casefold().split())
+
+    def execute(self, arguments, *, timeout: float, cancel_event: threading.Event) -> ToolResult:
+        query = arguments.get("query") if isinstance(arguments, Mapping) else None
+        if not isinstance(query, str):
+            return ToolResult("Online lookup needs a query from the user's request.", success=False)
+        normalized_query = " ".join(query.casefold().split())
+        if not normalized_query or len(normalized_query) > 300 or normalized_query not in self._request:
+            return ToolResult("Online lookup query must come from the user's request.", success=False)
+        if self.name == "web_search" and arguments.get("category") == "news":
+            if not re.search(r"\b(?:news|headlines)\b", self._request):
+                return ToolResult("News search was not requested.", success=False)
+        return self._tool.execute(arguments, timeout=timeout, cancel_event=cancel_event)
+
+
 class RequestOrchestrator:
     def __init__(
         self,
@@ -41,6 +64,7 @@ class RequestOrchestrator:
         router: OrionRouter | None = None,
         capabilities: CapabilityPolicy | None = None,
         command_handlers: Mapping[str, Callable[[], str]] | None = None,
+        confirm_action: Callable[[str], bool] | None = None,
     ):
         self.settings = settings
         self.model = model
@@ -50,6 +74,7 @@ class RequestOrchestrator:
         self.router = router or OrionRouter()
         self.capabilities = capabilities or CapabilityPolicy()
         self.command_handlers = dict(command_handlers or {})
+        self.confirm_action = confirm_action
         self.context_builder = ContextBuilder(settings)
         self.agent = AgentController(
             settings,
@@ -100,7 +125,12 @@ class RequestOrchestrator:
             return self._delete_episode(request, decision)
 
         if decision.kind == RouteKind.REMINDER:
-            return self._handle_reminder(request, decision)
+            result = self._handle_reminder(request, decision)
+            if result.completed:
+                return result
+            if decision.action in {"create", "update"}:
+                return self._run_planner(request, decision)
+            return result
 
         if decision.kind == RouteKind.SIMPLE_COMMAND:
             handler = self.command_handlers.get(decision.action or "")
@@ -147,11 +177,65 @@ class RequestOrchestrator:
         capability = self.capabilities.assess(request)
         if not capability.supported:
             return self._result(decision, capability.response, False)
-        agent_result = self.agent.run(
+        return self._run_planner(request, decision)
+
+    def _run_planner(self, request: str, decision: RouteDecision) -> RequestResult:
+        allowed_names = self._authorized_agent_tools(request)
+        available_tools = dict(self.tools.tools)
+        for name in {"weather", "web_search"}.intersection(allowed_names):
+            tool = available_tools.get(name)
+            if tool is not None:
+                available_tools[name] = _RequestBoundFactualTool(tool, request)
+        if "reminder" in allowed_names and self.reminders is not None:
+            reminder_tool = ReminderTool(
+                self.reminders, request, confirm_action=self.confirm_action
+            )
+            available_tools[reminder_tool.name] = reminder_tool
+        descriptions = {
+            "time": 'time: arguments {"action":"time|date"}',
+            "system_status": "system_status: arguments {}",
+            "weather": 'weather: arguments {"query":"copy the relevant phrase from the user request"}',
+            "web_search": 'web_search: arguments {"query":"copy the search phrase from the user request","category":"general|news"}',
+            "reminder": ReminderTool.description,
+        }
+        tool_guidance = "\n".join(
+            descriptions[name] for name in sorted(allowed_names) if name in descriptions
+        )
+        task_state = (
+            "You are the planner. If request is incomplete, ambiguous, or unsupported, ask a concise clarification. "
+            "Never guess missing reminder title, time, or target. Use only authorized tools listed here. "
+            "Complete each requested step before reporting success.\nAuthorized tools:\n"
+            + (tool_guidance or "none")
+        )
+        agent = AgentController(
+            self.settings,
+            self.model,
+            available_tools,
+            context_builder=self.context_builder,
+            memory=self.memory,
+        )
+        agent_result = agent.run(
             request,
-            initial_task_state=f"Registered tools: {', '.join(self.tools.names()) or 'none'}",
+            initial_task_state=task_state,
+            allowed_tool_names=allowed_names,
         )
         return self._result(decision, agent_result.response, agent_result.completed)
+
+    def _authorized_agent_tools(self, request: str) -> tuple[str, ...]:
+        normalized = " ".join(request.casefold().split())
+        allowed: set[str] = set()
+        if re.search(r"\b(?:weather|forecast|temperature|rain|snow)\b", normalized):
+            allowed.add("weather")
+        if re.search(r"\b(?:search|look up|lookup|browse|current|latest|recent|news|headlines)\b", normalized):
+            allowed.add("web_search")
+        if re.search(r"\b(?:what time|current time|time now|date|what day|today)\b", normalized):
+            allowed.add("time")
+        if re.search(r"\b(?:system|device|memory|disk|storage)\b.{0,30}\b(?:status|health|free|available)\b", normalized):
+            allowed.add("system_status")
+        if self.reminders is not None and re.search(r"\b(?:reminder|remind me)\b", normalized):
+            allowed.add("reminder")
+        allowed.intersection_update(self.tools.names() + (("reminder",) if self.reminders is not None else ()))
+        return tuple(sorted(allowed))
 
     def _execute(self, name: str, arguments: Mapping[str, object]) -> ToolResult:
         tool = self.tools.get(name)
@@ -174,8 +258,16 @@ class RequestOrchestrator:
         ).strip(" ?.!\t")
         if not query:
             return self._result(decision, "Tell me which saved discussion to forget.", False)
-        deletion: EpisodeDeleteResult = self.memory.delete_episode_by_query(query)
-        if deletion.status == "deleted":
+        deletion: EpisodeDeleteResult = self.memory.find_episode_by_query(query)
+        if deletion.status == "found":
+            record = deletion.matches[0]
+            if self.confirm_action is not None and not self.confirm_action(
+                f"Delete saved memory {record.content}? Say yes to confirm or no to cancel."
+            ):
+                return self._result(decision, "Memory deletion was not confirmed.", False)
+            deleted = self.memory.delete_episode(record.id)
+            if not deleted:
+                return self._result(decision, "I could not find a matching saved memory.", False)
             return self._result(decision, "I deleted the matching episode.")
         if deletion.status == "ambiguous":
             choices = "; ".join(
@@ -272,6 +364,15 @@ class RequestOrchestrator:
             )
         reminder = matches[0]
         if action == "cancel":
+            if self.confirm_action is not None:
+                local_due = reminder.due_at.astimezone(ZoneInfo(reminder.timezone))
+                prompt = (
+                    f"Cancel reminder {reminder.title}, due "
+                    f"{local_due.strftime('%A %d %B at %I:%M %p')}? "
+                    "Say yes to confirm or no to cancel."
+                )
+                if not self.confirm_action(prompt):
+                    return self._result(decision, "Reminder cancellation was not confirmed.", False)
             cancelled = self.reminders.cancel(reminder.id)
             response = "Reminder cancelled." if cancelled else "Reminder was no longer pending."
             return self._result(decision, response, cancelled)
