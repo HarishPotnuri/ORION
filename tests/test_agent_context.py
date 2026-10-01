@@ -304,6 +304,16 @@ class AgentControllerTests(unittest.TestCase):
         self.assertEqual(result.reason, "invalid_model_response")
         self.assertNotIn("42", result.response)
 
+    def test_invalid_or_truncated_model_output_never_executes_tool(self):
+        model = ScriptedModel("not JSON", '{"type":"tool","name":"lookup"')
+        tool = FakeTool()
+
+        result = self.controller(model, tool).run("Look this up")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.reason, "invalid_model_response")
+        self.assertEqual(tool.calls, [])
+
     def test_empty_request_does_not_call_model(self):
         model = ScriptedModel()
 

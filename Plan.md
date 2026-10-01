@@ -182,6 +182,8 @@ Acceptance criteria:
 - Core deterministic requests still work if the model runtime is stopped or unavailable.
 - All selected dependency and model versions are recorded so a later update can be compared reproducibly.
 
+Current validation evidence: Laptop environment is Windows x64, Python 3.11.9; editable package installation and `pip check` pass; the full suite has 123 passing tests and 30 subtests. Configuration and a deterministic local-time request pass. Ollama 0.34.4 with `qwen3:1.7b` returned valid ORION responses in 3/3 consecutive laptop requests. Malformed/truncated model output has regression coverage proving no tool executes before a valid agent decision. This does not verify Linux ARM64 wheels, Raspberry Pi OS installation, audio devices, GPIO permissions, local model startup on Pi, or performance. The exact Pi OS image and release must be recorded from the image used for the first hardware run; do not infer it from the laptop.
+
 ### Phase 10: Integrated Service, Controls, and Operations
 
 1. Provide one native systemd service for the persistent voice assistant and reminder scheduler. Avoid a separate reminder process/database unless testing demonstrates a concrete need.
