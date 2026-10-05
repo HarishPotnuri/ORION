@@ -87,6 +87,20 @@ class CapabilityPolicyTests(unittest.TestCase):
 
 
 class LocalToolTests(unittest.TestCase):
+    def test_planner_logs_completion_reason_without_request_text(self):
+        request = "Explain Kafka briefly"
+        model = ScriptedModel(
+            '{"type":"final","response":"Kafka is a distributed event platform."}'
+        )
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([]))
+
+        with self.assertLogs("orion.core.orchestrator", level="INFO") as logs:
+            result = orchestrator.handle(request)
+
+        self.assertTrue(result.completed)
+        self.assertIn("reason=completed", "\n".join(logs.output))
+        self.assertNotIn(request, "\n".join(logs.output))
+
     def test_time_tool_is_offline_and_timezone_aware(self):
         settings = Settings()
         fixed = datetime(2026, 9, 28, 13, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
@@ -248,6 +262,57 @@ class FactualToolTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_clear_conversation_preserves_saved_memory_and_reminders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            memory = MemoryManager.from_settings(settings)
+            reminders = ReminderManager.from_settings(settings)
+            model = ScriptedModel('{"type":"final","response":"Fresh answer."}')
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([]), memory=memory, reminders=reminders
+            )
+            try:
+                memory.save_explicit_request("Remember that my favorite color is green")
+                reminder = reminders.create_from_request(
+                    "Remind me tomorrow at 1 PM about project meeting"
+                )
+                saved = memory.list_memories()
+                for command in (
+                    "clear conversation history",
+                    "Please wipe conversational memory!",
+                    "reset our conversation",
+                    "clear chat history",
+                ):
+                    with self.subTest(command=command):
+                        memory.add_turn("misunderstood old request", "stale old reply")
+                        result = orchestrator.handle(command)
+                        self.assertTrue(result.completed)
+                        self.assertEqual(result.route.action, "clear_conversation")
+                        self.assertIn("Conversation history cleared", result.response)
+                        self.assertEqual(memory.recent_messages(16), ())
+                        self.assertEqual(memory.list_memories(), saved)
+                        self.assertIsNotNone(reminders.get(reminder.id))
+                        self.assertEqual(model.calls, [])
+
+                orchestrator.handle("Explain gravity briefly")
+                contents = "\n".join(message.content for message in model.calls[0][0])
+                self.assertNotIn("misunderstood old request", contents)
+                self.assertNotIn("stale old reply", contents)
+                self.assertNotIn("Conversation history cleared", contents)
+            finally:
+                reminders.close()
+                memory.close()
+
+    def test_clear_conversation_without_memory_fails_without_model_call(self):
+        model = ScriptedModel('{"type":"final","response":"unexpected"}')
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([]))
+
+        result = orchestrator.handle("clear conversation history")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.response, "Memory is not available in this session.")
+        self.assertEqual(model.calls, [])
+
     def test_planner_can_combine_weather_and_reminder_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")

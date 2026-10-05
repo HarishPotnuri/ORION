@@ -1,9 +1,11 @@
 import array
 import threading
 import tempfile
+import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from orion.audio.capture import AudioBufferOverflow, AudioGate, SoundDeviceChunkSource
 from orion.audio.stt import PushToTalkInput, VoskTranscriber
@@ -53,6 +55,17 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(result, chunks[1:7])
 
+    def test_vad_logs_end_of_speech_timing_without_audio_content(self):
+        settings = self.small_settings()
+        chunks = [pcm(1000, 10), pcm(0, 10), pcm(0, 10), pcm(0, 10)]
+
+        with self.assertLogs("orion.audio.vad", level="INFO") as logs:
+            list(VoiceActivityDetector(settings).utterance_chunks(chunks))
+
+        self.assertIn("stage=vad", logs.output[0])
+        self.assertIn("outcome=end_of_speech", logs.output[0])
+        self.assertNotIn("1000", logs.output[0])
+
     def test_vad_enforces_maximum_utterance_length(self):
         detector = VoiceActivityDetector(self.small_settings(max_utterance_seconds=0.03))
         chunks = [pcm(1000, 10)] * 10
@@ -67,7 +80,10 @@ class AudioTests(unittest.TestCase):
         )
         silence = [pcm(0, 10)] * 10
 
-        self.assertEqual(list(detector.utterance_chunks(silence)), [])
+        with self.assertLogs("orion.audio.vad", level="INFO") as logs:
+            self.assertEqual(list(detector.utterance_chunks(silence)), [])
+
+        self.assertIn("outcome=no_speech", logs.output[-1])
 
     def test_vosk_transcribes_chunks_without_audio_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +109,26 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(transcript, "recognized words")
             self.assertEqual(len(recognizers[0].chunks), 5)
             self.assertEqual(list(model_path.iterdir()), [])
+
+    def test_vosk_logs_stt_duration_and_outcome_without_transcript(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model"
+            model_path.mkdir()
+            transcriber = VoskTranscriber(
+                self.small_settings(stt_model_path=model_path),
+                model_factory=lambda _path: object(),
+                recognizer_factory=FakeRecognizer,
+            )
+            chunks = iter(
+                [pcm(1000, 10), pcm(0, 10), pcm(0, 10), pcm(0, 10)]
+            )
+
+            with self.assertLogs("orion.audio.stt", level="INFO") as logs:
+                transcriber.transcribe_chunks(chunks)
+
+        self.assertIn("stage=stt", logs.output[-1])
+        self.assertIn("outcome=transcribed", logs.output[-1])
+        self.assertNotIn("recognized words", logs.output[-1])
 
     def test_push_to_talk_confirmation_timeout_does_not_stop_service(self):
         service_stop = threading.Event()
@@ -184,6 +220,149 @@ class AudioTests(unittest.TestCase):
             speech.speak("test")
         gate.wait_until_open()
         self.assertEqual(played, [([0.1, -0.1], 24000)])
+
+    def test_tts_warmup_loads_engine_and_runs_discarded_synthesis(self):
+        generated = []
+        played = []
+
+        class FakeTTS:
+            def __init__(self, _model_name):
+                generated.append("initialized")
+
+            def generate(self, text, *, voice):
+                generated.append((text, voice))
+                return [0.1, -0.1]
+
+        speech = KittenSpeechOutput(
+            self.small_settings(tts_voice="test-voice"),
+            AudioGate(),
+            tts_factory=FakeTTS,
+            play=lambda audio, **_kwargs: played.append(audio),
+            wait=lambda: None,
+            stop=lambda: None,
+        )
+
+        speech.warmup()
+        self.assertEqual(played, [])
+        speech.speak("A real response")
+
+        self.assertEqual(generated, ["initialized", ("Ready.", "test-voice"), ("A real response", "test-voice")])
+        self.assertEqual(played, [[0.1, -0.1]])
+
+    def test_tts_resamples_when_output_device_rejects_generated_rate(self):
+        gate = AudioGate()
+        played = []
+
+        class FakeTTS:
+            def __init__(self, _model_name):
+                pass
+
+            def generate(self, _text, *, voice):
+                return [0.0, 1.0]
+
+        class FakeSoundDevice:
+            class PortAudioError(Exception):
+                pass
+
+            @staticmethod
+            def check_output_settings(*, samplerate, **_kwargs):
+                if samplerate == 24000:
+                    raise FakeSoundDevice.PortAudioError("unsupported rate")
+
+            @staticmethod
+            def query_devices(_device, _kind):
+                return {"default_samplerate": 44100}
+
+            @staticmethod
+            def play(audio, *, samplerate):
+                played.append((audio, samplerate))
+
+            @staticmethod
+            def wait():
+                pass
+
+            @staticmethod
+            def stop():
+                pass
+
+            class RawOutputStream:
+                def __init__(self, *, samplerate, **_kwargs):
+                    self.samplerate = samplerate
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def write(self, audio):
+                    played.append((audio, self.samplerate))
+
+                def abort(self):
+                    pass
+
+        speech = KittenSpeechOutput(
+            self.small_settings(), gate, tts_factory=FakeTTS
+        )
+        with patch.dict(sys.modules, {"sounddevice": FakeSoundDevice}):
+            speech.speak("test")
+
+        self.assertEqual(played[0][1], 44100)
+        resampled = array.array("f")
+        resampled.frombytes(played[0][0])
+        self.assertEqual(len(resampled), 4)
+        self.assertAlmostEqual(resampled[1], 24000 / 44100)
+
+    def test_tts_aborts_owned_output_stream_on_interrupt(self):
+        gate = AudioGate()
+        playback = []
+
+        class FakeTTS:
+            def __init__(self, _model_name):
+                pass
+
+            def generate(self, _text, *, voice):
+                return [0.1] * 100
+
+        class FakeStream:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                playback.append("closed")
+                return False
+
+            def write(self, _audio):
+                playback.append("write")
+                gate.request_interrupt()
+
+            def abort(self):
+                playback.append("abort")
+
+        class FakeSoundDevice:
+            class PortAudioError(Exception):
+                pass
+
+            @staticmethod
+            def check_output_settings(**_kwargs):
+                pass
+
+        speech = KittenSpeechOutput(
+            self.small_settings(),
+            gate,
+            tts_factory=FakeTTS,
+            output_stream_factory=FakeStream,
+        )
+        with patch.dict(sys.modules, {"sounddevice": FakeSoundDevice}):
+            with self.assertLogs("orion.audio.tts", level="INFO") as logs:
+                speech.speak("test")
+
+        self.assertEqual(playback, ["write", "abort", "closed"])
+        self.assertTrue(gate.is_open)
+        self.assertIn("TTS playback outcome=interrupted", "\n".join(logs.output))
 
     def test_tts_stops_playback_when_gate_receives_interrupt(self):
         gate = AudioGate()

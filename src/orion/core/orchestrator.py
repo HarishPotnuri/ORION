@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,6 +23,8 @@ from .capabilities import CapabilityPolicy
 from .context import ContextBuilder
 from .contracts import LocalModel, ToolResult
 from .router import OrionRouter, RouteDecision, RouteKind
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,8 @@ class RequestOrchestrator:
     def handle(self, request: str) -> RequestResult:
         decision = self.router.route(request)
         result = self._dispatch(request, decision)
+        if decision.kind == RouteKind.MEMORY_DELETE and decision.action == "clear_conversation":
+            return result
         if self.memory is not None and request.strip() and result.response.strip():
             self.memory.add_turn(request, result.response)
         return result
@@ -122,6 +128,14 @@ class RequestOrchestrator:
             return self._result(decision, "Saved memories: " + "; ".join(records))
 
         if decision.kind == RouteKind.MEMORY_DELETE:
+            if decision.action == "clear_conversation":
+                if self.memory is None:
+                    return self._result(decision, "Memory is not available in this session.", False)
+                self.memory.clear_conversation()
+                return self._result(
+                    decision,
+                    "Conversation history cleared. Saved memories and reminders are unchanged.",
+                )
             return self._delete_episode(request, decision)
 
         if decision.kind == RouteKind.REMINDER:
@@ -214,10 +228,18 @@ class RequestOrchestrator:
             context_builder=self.context_builder,
             memory=self.memory,
         )
+        started = time.monotonic()
         agent_result = agent.run(
             request,
             initial_task_state=task_state,
             allowed_tool_names=allowed_names,
+        )
+        logger.info(
+            "Planner finished completed=%s reason=%s steps=%d elapsed_ms=%.1f",
+            agent_result.completed,
+            agent_result.reason,
+            agent_result.steps,
+            (time.monotonic() - started) * 1000,
         )
         return self._result(decision, agent_result.response, agent_result.completed)
 

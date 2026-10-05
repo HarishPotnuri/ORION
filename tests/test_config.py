@@ -24,6 +24,10 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.memory_recent_message_limit, 16)
         self.assertEqual(settings.memory_search_limit, 5)
         self.assertEqual(settings.reminder_timezone, "Asia/Kolkata")
+        self.assertEqual(settings.tts_interrupt_pin, 16)
+        self.assertEqual(settings.status_led_red_pin, 27)
+        self.assertEqual(settings.status_led_pin, 25)
+        self.assertEqual(settings.status_led_blue_pin, 17)
 
     def test_rejects_non_local_model_endpoint(self) -> None:
         with self.clean_environment(
@@ -39,6 +43,16 @@ class SettingsTests(unittest.TestCase):
 
     def test_rejects_reused_gpio_pins(self) -> None:
         with self.clean_environment({"ORION_STATUS_LED_PIN": "23"}):
+            with self.assertRaisesRegex(ValueError, "must be unique"):
+                Settings.from_environment()
+
+    def test_rejects_interrupt_button_gpio_conflict(self) -> None:
+        with self.clean_environment({"ORION_TTS_INTERRUPT_PIN": "23"}):
+            with self.assertRaisesRegex(ValueError, "must be unique"):
+                Settings.from_environment()
+
+    def test_rejects_rgb_led_gpio_conflict(self) -> None:
+        with self.clean_environment({"ORION_STATUS_LED_BLUE_PIN": "27"}):
             with self.assertRaisesRegex(ValueError, "must be unique"):
                 Settings.from_environment()
 

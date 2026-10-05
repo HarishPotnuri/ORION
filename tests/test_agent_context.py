@@ -143,6 +143,11 @@ class ContextBuilderTests(unittest.TestCase):
         with self.assertRaises(ContextBudgetError):
             builder.build("This request must not be dropped")
 
+    def test_prompt_does_not_put_schema_placeholders_in_spoken_response(self):
+        context = self.builder.build("Explain Kafka")
+
+        self.assertNotIn("user-facing answer", context.messages[0].content)
+
 
 class AgentControllerTests(unittest.TestCase):
     def settings(self, **changes):
@@ -294,6 +299,31 @@ class AgentControllerTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(result.response, "Recovered.")
         self.assertEqual(len(model.calls), 2)
+
+    def test_retries_prompt_placeholder_final_response(self):
+        model = ScriptedModel(
+            final("user-facing answer"),
+            final("Kafka streams events between systems."),
+        )
+
+        result = self.controller(model).run("Explain Kafka")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.response, "Kafka streams events between systems.")
+        self.assertEqual(len(model.calls), 2)
+        self.assertLessEqual(model.calls[0][1], 128)
+
+    def test_repeated_prompt_placeholder_fails_closed(self):
+        model = ScriptedModel(
+            final("user-facing answer"),
+            final("user-facing answer"),
+        )
+
+        result = self.controller(model).run("Explain Kafka")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.reason, "invalid_model_response")
+        self.assertNotIn("user-facing answer", result.response)
 
     def test_invalid_model_decision_returns_safe_fallback(self):
         model = ScriptedModel("I think the answer is 42")

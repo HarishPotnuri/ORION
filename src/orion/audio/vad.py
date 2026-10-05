@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import math
+import logging
+import time
 from collections import deque
 from collections.abc import Iterable, Iterator
 
 from ..config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceActivityDetector:
@@ -38,44 +42,67 @@ class VoiceActivityDetector:
 
     def utterance_chunks(self, chunks: Iterable[bytes]) -> Iterator[bytes]:
         """Yield one speech utterance and stop at silence or configured maximum."""
+        started_at = time.perf_counter()
+        speech_started_at = None
+        outcome = "source_ended"
         preroll: deque[bytes] = deque(maxlen=self.preroll_chunks)
         started = False
         silence_count = 0
         emitted = 0
         observed = 0
 
-        for chunk in chunks:
-            if observed >= self.max_chunks:
-                return
-            observed += 1
-            if not started:
-                preroll.append(chunk)
+        try:
+            for chunk in chunks:
+                if observed >= self.max_chunks:
+                    outcome = "max_duration"
+                    return
+                observed += 1
+                if not started:
+                    preroll.append(chunk)
+                    if self._rms(chunk) < self.threshold:
+                        silence_count += 1
+                        if silence_count >= self.silence_chunks:
+                            outcome = "no_speech"
+                            return
+                        continue
+                    started = True
+                    speech_started_at = time.perf_counter()
+                    silence_count = 0
+                    if not preroll:
+                        yield chunk
+                        emitted += 1
+                        continue
+                    for buffered_chunk in preroll:
+                        if emitted >= self.max_chunks:
+                            outcome = "max_duration"
+                            return
+                        yield buffered_chunk
+                        emitted += 1
+                    preroll.clear()
+                    continue
+
+                if emitted >= self.max_chunks:
+                    outcome = "max_duration"
+                    break
+                yield chunk
+                emitted += 1
                 if self._rms(chunk) < self.threshold:
                     silence_count += 1
                     if silence_count >= self.silence_chunks:
-                        return
-                    continue
-                started = True
-                silence_count = 0
-                if not preroll:
-                    yield chunk
-                    emitted += 1
-                    continue
-                for buffered_chunk in preroll:
-                    if emitted >= self.max_chunks:
-                        return
-                    yield buffered_chunk
-                    emitted += 1
-                preroll.clear()
-                continue
-
-            if emitted >= self.max_chunks:
-                break
-            yield chunk
-            emitted += 1
-            if self._rms(chunk) < self.threshold:
-                silence_count += 1
-                if silence_count >= self.silence_chunks:
-                    break
+                        outcome = "end_of_speech"
+                        break
+                else:
+                    silence_count = 0
             else:
-                silence_count = 0
+                if observed >= self.max_chunks:
+                    outcome = "max_duration"
+        finally:
+            logger.info(
+                "Voice stage=vad elapsed_ms=%.1f speech_ms=%.1f outcome=%s chunks=%d",
+                (time.perf_counter() - started_at) * 1000,
+                (time.perf_counter() - speech_started_at) * 1000
+                if speech_started_at is not None
+                else 0.0,
+                outcome,
+                emitted,
+            )

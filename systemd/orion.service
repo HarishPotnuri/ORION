@@ -1,0 +1,39 @@
+[Unit]
+Description=ORION local voice assistant and reminder scheduler
+Wants=network-online.target
+After=network-online.target sound.target ollama.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+	User=orion-service
+	Group=orion-service
+SupplementaryGroups=audio gpio
+	WorkingDirectory=/var/lib/orion
+EnvironmentFile=/etc/orion/orion.env
+Environment=PYTHONUNBUFFERED=1
+	ExecStart=/opt/orion/.venv-voice/bin/orion --run-voice
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=150s
+KillSignal=SIGTERM
+UMask=0077
+StateDirectory=orion
+StateDirectoryMode=0750
+	CacheDirectory=orion
+	CacheDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+	ProtectHome=yes
+ReadWritePaths=/var/lib/orion
+	ReadWritePaths=/var/cache/orion
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

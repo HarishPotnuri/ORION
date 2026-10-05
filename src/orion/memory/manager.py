@@ -93,6 +93,9 @@ class MemoryManager:
     def recent_messages(self, limit: int) -> Sequence[ChatMessage]:
         return self.conversation.recent_messages(limit)
 
+    def clear_conversation(self) -> None:
+        self.conversation.clear()
+
     def search(self, query: str, *, limit: int) -> Sequence[str]:
         bounded_limit = min(limit, self.max_search_results)
         if bounded_limit < 1:

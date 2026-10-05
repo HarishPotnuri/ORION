@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from orion.app import main
 from orion.reminders.manager import ReminderManager
 from orion.reminders.models import ReminderStatus
+from orion.reminders.ownership import SchedulerAlreadyRunningError
 from orion.reminders.parser import ReminderParseError, ReminderParser
 from orion.reminders.scheduler import ReminderNotifier, ReminderScheduler
 from orion.reminders.store import SQLiteReminderStore
@@ -258,8 +259,46 @@ class ReminderSchedulerTests(unittest.TestCase):
         self.store.close()
 
         self.store = SQLiteReminderStore(self.path)
+        self.assertEqual(self.store.get(reminder.id).status, ReminderStatus.DELIVERING)
+        delivered = []
+        scheduler = ReminderScheduler(
+            self.store,
+            delivered.append,
+            clock=lambda: self.clock_value,
+        )
+        scheduler.start()
+        scheduler.stop()
 
-        self.assertEqual(self.store.get(reminder.id).status, ReminderStatus.PENDING)
+        self.assertEqual([item.id for item in delivered], [reminder.id])
+        self.assertEqual(self.store.get(reminder.id).status, ReminderStatus.COMPLETED)
+
+    def test_only_one_scheduler_can_own_a_database(self):
+        other_store = SQLiteReminderStore(self.path)
+        owner = ReminderScheduler(self.store, lambda _reminder: None)
+        second = ReminderScheduler(other_store, lambda _reminder: None)
+        try:
+            owner.start()
+            with self.assertRaises(SchedulerAlreadyRunningError):
+                second.start()
+            owner.stop()
+            second.start()
+            second.stop()
+        finally:
+            owner.stop()
+            second.stop()
+            other_store.close()
+
+    def test_direct_due_processing_cannot_bypass_scheduler_ownership(self):
+        owner = ReminderScheduler(self.store, lambda _reminder: None)
+        other_store = SQLiteReminderStore(self.path)
+        second = ReminderScheduler(other_store, lambda _reminder: None)
+        try:
+            owner.start()
+            with self.assertRaises(SchedulerAlreadyRunningError):
+                second.process_due()
+        finally:
+            owner.stop()
+            other_store.close()
 
     def test_two_store_connections_cannot_claim_same_reminder(self):
         reminder = self.add("Remind me tomorrow at 1 PM to check deployment")

@@ -50,10 +50,17 @@ class SQLiteReminderStore:
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS reminders_due_idx ON reminders(status, due_at_utc)"
             )
-            self._connection.execute(
+            self._connection.commit()
+
+    def recover_interrupted_deliveries(self) -> int:
+        """Return stale claims to pending; call only while owning the scheduler lock."""
+        with self._lock:
+            self._ensure_open()
+            cursor = self._connection.execute(
                 "UPDATE reminders SET status = 'pending' WHERE status = 'delivering'"
             )
             self._connection.commit()
+        return cursor.rowcount
 
     def create(
         self,

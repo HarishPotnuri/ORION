@@ -2,9 +2,17 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from orion.app import _confirm_spoken_action, _run_voice_loop, _set_led_status, main
+from orion.app import (
+    _confirm_spoken_action,
+    _create_audio_input,
+    _create_interrupt_button,
+    _run_voice_loop,
+    _set_led_status,
+    main,
+)
 from orion.audio.capture import AudioGate
 from orion.audio.stt import PushToTalkInput, WakeWordInput
 from orion.config import Settings
@@ -56,23 +64,25 @@ class FakeScheduler:
 
 
 class VoiceServiceTests(unittest.TestCase):
-    def test_led_status_maps_to_distinct_brightness_levels(self):
+    def test_led_status_maps_to_distinct_rgb_colors(self):
         class FakeLED:
-            value = None
+            color = None
 
         led = FakeLED()
         states = {
-            "IDLE": 0.0,
-            "LISTENING": 0.2,
-            "PROCESSING": 0.45,
-            "SPEAKING": 0.7,
-            "MUTED": 0.05,
-            "ERROR": 1.0,
+            "IDLE": (0.0, 0.0, 0.0),
+            "LISTENING": (0.0, 0.2, 0.0),
+            "PROCESSING": (0.0, 0.0, 0.45),
+            "SPEAKING": (0.0, 0.7, 0.7),
+            "MUTED": (0.05, 0.025, 0.0),
+            "ERROR": (1.0, 0.0, 0.0),
         }
         for status, expected in states.items():
             with self.subTest(status=status):
                 _set_led_status(led, status)
-                self.assertEqual(led.value, expected)
+                self.assertEqual(led.color, expected)
+        _set_led_status(led, "UNKNOWN")
+        self.assertEqual(led.color, (0.0, 0.0, 0.0))
 
     def test_spoken_confirmation_accepts_only_clear_yes(self):
         class AudioInput:
@@ -102,6 +112,77 @@ class VoiceServiceTests(unittest.TestCase):
             self.assertEqual(main(["--run-voice"]), 0)
         run_service.assert_called_once()
 
+    def test_push_to_talk_warms_stt_before_announcing_readiness(self):
+        events = []
+        button = FakeButton()
+
+        class AudioInput:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def warmup(self):
+                events.append("warmup")
+
+        with (
+            patch.dict("sys.modules", {"gpiozero": SimpleNamespace(Button=lambda _pin: button)}),
+            patch("orion.app.PushToTalkInput", AudioInput),
+            patch(
+                "orion.app.logger.info",
+                side_effect=lambda message, *args: events.append(message % args if args else message),
+            ),
+        ):
+            audio_input, actual_button = _create_audio_input(
+                Settings(), AudioGate(), threading.Event()
+            )
+
+        self.assertIsInstance(audio_input, AudioInput)
+        self.assertIs(actual_button, button)
+        self.assertEqual(events, ["warmup", "Press GPIO 23 to speak"])
+
+    def test_push_to_talk_closes_button_when_stt_warmup_fails(self):
+        button = FakeButton()
+
+        class AudioInput:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def warmup(self):
+                raise RuntimeError("model load failed")
+
+        with (
+            patch.dict("sys.modules", {"gpiozero": SimpleNamespace(Button=lambda _pin: button)}),
+            patch("orion.app.PushToTalkInput", AudioInput),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model load failed"):
+                _create_audio_input(Settings(), AudioGate(), threading.Event())
+
+        self.assertTrue(button.closed)
+
+    def test_separate_interrupt_button_and_ptt_both_request_playback_cutoff(self):
+        created = []
+
+        class Button:
+            def __init__(self, pin):
+                self.pin = pin
+                self.when_pressed = None
+                created.append(self)
+
+        ptt_button = Button(23)
+        gate = AudioGate()
+        with patch.dict("sys.modules", {"gpiozero": SimpleNamespace(Button=Button)}):
+            interrupt_button = _create_interrupt_button(
+                Settings(), gate, ptt_button
+            )
+
+        self.assertEqual(interrupt_button.pin, 16)
+        self.assertIsNot(interrupt_button, ptt_button)
+        with gate.speaking():
+            interrupt_button.when_pressed()
+            self.assertTrue(gate.wait_for_interrupt(0))
+        with gate.speaking():
+            ptt_button.when_pressed()
+            self.assertTrue(gate.wait_for_interrupt(0))
+
     def test_voice_loop_handles_multiple_turns_and_stops_scheduler(self):
         stop_event = threading.Event()
         statuses = []
@@ -118,7 +199,11 @@ class VoiceServiceTests(unittest.TestCase):
         class Orchestrator:
             def handle(self, request):
                 handled.append(request)
-                return type("Result", (), {"response": f"reply: {request}"})()
+                return SimpleNamespace(
+                    response=f"reply: {request}",
+                    route=SimpleNamespace(kind=SimpleNamespace(value="test")),
+                    completed=True,
+                )
 
         class SpeechOutput:
             def speak(self, text):
@@ -126,14 +211,15 @@ class VoiceServiceTests(unittest.TestCase):
                 if len(spoken) == 2:
                     stop_event.set()
 
-        _run_voice_loop(
-            AudioInput(),
-            Orchestrator(),
-            SpeechOutput(),
-            scheduler,
-            stop_event,
-            statuses.append,
-        )
+        with self.assertLogs("orion.app", level="INFO") as logs:
+            _run_voice_loop(
+                AudioInput(),
+                Orchestrator(),
+                SpeechOutput(),
+                scheduler,
+                stop_event,
+                statuses.append,
+            )
 
         self.assertTrue(scheduler.started)
         self.assertTrue(scheduler.stopped)
@@ -143,6 +229,12 @@ class VoiceServiceTests(unittest.TestCase):
             "reply: Remind me tomorrow",
         ])
         self.assertEqual(statuses[-1], "IDLE")
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("stage=input_total", joined_logs)
+        self.assertIn("stage=orchestration", joined_logs)
+        self.assertIn("stage=tts", joined_logs)
+        self.assertNotIn("What time is it?", joined_logs)
+        self.assertNotIn("Remind me tomorrow", joined_logs)
 
     def test_voice_loop_speaks_short_error_after_turn_failure(self):
         stop_event = threading.Event()
@@ -247,6 +339,19 @@ class VoiceServiceTests(unittest.TestCase):
         with gate.speaking():
             self.assertFalse(gate.is_open)
         self.assertTrue(gate.is_open)
+
+    def test_status_speech_output_warms_wrapped_engine(self):
+        from orion.app import _StatusSpeechOutput
+
+        events = []
+        speech = _StatusSpeechOutput(
+            type("Speech", (), {"warmup": lambda _self: events.append("warm")})(),
+            lambda status: events.append(status),
+        )
+
+        speech.warmup()
+
+        self.assertEqual(events, ["warm"])
 
 
 if __name__ == "__main__":

@@ -7,14 +7,14 @@ name = "orion-assistant"
 version = "0.1.0"
 description = "Privacy-first local voice assistant for Raspberry Pi"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
 voice = [
-    "kittentts",
+    "kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl",
     "sounddevice>=0.5.3",
     "vosk>=0.3.45",
 ]
@@ -25,9 +25,6 @@ pi = [
 ]
 test = ["pytest>=8.0"]
 
-[tool.uv.sources]
-kittentts = { url = "https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl" }
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -36,3 +33,8 @@ where = ["src"]
 
 [project.scripts]
 orion = "orion.app:main"
+
+[tool.uv]
+exclude-dependencies = [
+    { package = { name = "misaki", version = "0.9.4" }, dependencies = ["spacy-curated-transformers"] },
+]

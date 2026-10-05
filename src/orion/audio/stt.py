@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -43,6 +44,9 @@ class VoskTranscriber:
         self._model = None
         self.stop_event = stop_event or threading.Event()
 
+    def warmup(self) -> None:
+        self._load_model()
+
     def _load_model(self):
         if self._model is None:
             if not Path(self.settings.stt_model_path).is_dir():
@@ -70,18 +74,29 @@ class VoskTranscriber:
                 raise RuntimeError("vosk is required for local speech recognition") from error
             recognizer_factory = KaldiRecognizer
 
+        started_at = time.perf_counter()
+        outcome = "failed"
         try:
-            recognizer = recognizer_factory(
-                self._load_model(), self.settings.audio_sample_rate
-            )
-            for chunk in self.vad.utterance_chunks(
-                self._until_stopped(chunks, stop_event)
-            ):
-                recognizer.AcceptWaveform(chunk)
+            try:
+                recognizer = recognizer_factory(
+                    self._load_model(), self.settings.audio_sample_rate
+                )
+                for chunk in self.vad.utterance_chunks(
+                    self._until_stopped(chunks, stop_event)
+                ):
+                    recognizer.AcceptWaveform(chunk)
+            finally:
+                self._close_chunks(chunks)
+            result = json.loads(recognizer.FinalResult())
+            transcript = str(result.get("text", "")).strip()
+            outcome = "transcribed" if transcript else "empty"
+            return transcript
         finally:
-            self._close_chunks(chunks)
-        result = json.loads(recognizer.FinalResult())
-        return str(result.get("text", "")).strip()
+            logger.info(
+                "Voice stage=stt elapsed_ms=%.1f outcome=%s",
+                (time.perf_counter() - started_at) * 1000,
+                outcome,
+            )
 
     def _until_stopped(
         self, chunks: Iterator[bytes], stop_event: _TurnStopEvent | None = None
@@ -118,8 +133,10 @@ class PushToTalkInput(VoskTranscriber):
 
     def next_utterance(self, timeout: float | None = None) -> str:
         turn_stop, timer = self._turn_stop(timeout)
+        wait_started = time.perf_counter()
         try:
             if turn_stop.is_set():
+                logger.info("Voice stage=ptt_wait elapsed_ms=0.0 outcome=timeout")
                 return ""
             self.gate.wait_until_open()
             while not turn_stop.is_set():
@@ -129,9 +146,17 @@ class PushToTalkInput(VoskTranscriber):
                 if getattr(self.button, "is_pressed", False):
                     break
             if turn_stop.is_set():
+                logger.info(
+                    "Voice stage=ptt_wait elapsed_ms=%.1f outcome=timeout",
+                    (time.perf_counter() - wait_started) * 1000,
+                )
                 return ""
             self.gate.wait_until_open()
             logger.info("Push-to-talk activated")
+            logger.info(
+                "Voice stage=ptt_wait elapsed_ms=%.1f outcome=pressed",
+                (time.perf_counter() - wait_started) * 1000,
+            )
             chunks = self.source.chunks(turn_stop)
             return self.transcribe_chunks(chunks, turn_stop)
         finally:

@@ -58,6 +58,11 @@ class OrionRouter:
         r"\b(forget|delete|remove|erase)\b.{0,80}\b(memory|episode|conversation|discussion|decision|what we discussed)\b"
         r"|\b(forget|delete|remove|erase)\b.{0,80}\babout\b",
     )
+    _conversation_reset = re.compile(
+        r"(?:please )?(?:clear|wipe|reset|forget|erase|delete) "
+        r"(?:(?:the|our|my|this) )?"
+        r"(?:conversation(?:al)? (?:history|memory)|chat history|conversation)"
+    )
     _memory_queries = re.compile(
         r"\b(what did we decide|what did i tell you|what do you remember|"
         r"what do you know about|do you remember|when did i say|recall)\b"
@@ -107,6 +112,8 @@ class OrionRouter:
         if self._reminder_terms.search(normalized):
             return RouteDecision(RouteKind.REMINDER, self._reminder_action(normalized))
 
+        if self._conversation_reset.fullmatch(normalized.rstrip(" ?.!")):
+            return RouteDecision(RouteKind.MEMORY_DELETE, "clear_conversation")
         if self._memory_deletions.search(normalized):
             return RouteDecision(RouteKind.MEMORY_DELETE)
         if self._memory_queries.search(normalized):

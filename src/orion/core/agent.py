@@ -25,6 +25,12 @@ from .contracts import (
 logger = logging.getLogger(__name__)
 _MAX_MODEL_RESPONSE_CHARS = 16_384
 _MAX_ARGUMENT_DEPTH = 8
+_MAX_MODEL_OUTPUT_TOKENS = 128
+_FINAL_RESPONSE_PLACEHOLDERS = (
+    "user facing answer",
+    "stable important user memory",
+    "short topic",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,22 +115,40 @@ class AgentController:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     return self._limit_result(step - 1, "task_timeout")
+                model_started = time.monotonic()
                 try:
                     raw_response = self._worker(
                         lambda: self.model.complete(
                             context.messages,
-                            max_tokens=min(512, self.settings.max_context_tokens),
+                            max_tokens=min(
+                                _MAX_MODEL_OUTPUT_TOKENS,
+                                self.settings.max_context_tokens,
+                            ),
                             timeout=remaining,
                         ),
                         remaining,
                     )
+                    logger.info(
+                        "Planner model call step=%d attempt=%d elapsed_ms=%.1f outcome=completed",
+                        step,
+                        attempt + 1,
+                        (time.monotonic() - model_started) * 1000,
+                    )
                 except TimeoutError:
+                    logger.warning(
+                        "Planner model call step=%d attempt=%d elapsed_ms=%.1f outcome=timeout",
+                        step,
+                        attempt + 1,
+                        (time.monotonic() - model_started) * 1000,
+                    )
                     return self._limit_result(step - 1, "model_timeout")
                 except Exception as error:
                     logger.warning(
-                        "Local model call failed (%s), attempt %d of 2",
+                        "Local model call failed (%s), step %d attempt %d elapsed_ms=%.1f",
                         type(error).__name__,
+                        step,
                         attempt + 1,
+                        (time.monotonic() - model_started) * 1000,
                     )
                     if attempt == 0 and self._clock() < deadline:
                         continue
@@ -199,9 +223,18 @@ class AgentController:
         if not isinstance(decision, dict):
             return None
         if decision.get("type") == "final" and isinstance(decision.get("response"), str):
+            response = decision["response"].strip()
+            normalized_response = " ".join(
+                response.casefold().replace("-", " ").split()
+            )
+            if any(
+                placeholder in normalized_response
+                for placeholder in _FINAL_RESPONSE_PLACEHOLDERS
+            ):
+                return None
             return {
                 "type": "final",
-                "response": decision["response"],
+                "response": response,
                 "memory_suggestions": self._parse_memory_suggestions(
                     decision.get("memory_suggestions", [])
                 ),

@@ -69,7 +69,10 @@ class Settings:
     tts_voice: str = "expr-voice-3-f"
     tts_sample_rate: int = 24000
     push_to_talk_pin: int = 23
+    tts_interrupt_pin: int = 16
+    status_led_red_pin: int = 27
     status_led_pin: int = 25
+    status_led_blue_pin: int = 17
     microphone_mute_pin: int | None = None
     speaker_mute_pin: int | None = None
     log_level: str = "INFO"
@@ -134,7 +137,10 @@ class Settings:
             tts_voice=os.getenv("ORION_TTS_VOICE", "expr-voice-3-f"),
             tts_sample_rate=_env_int("TTS_SAMPLE_RATE", 24000),
             push_to_talk_pin=_env_int("PUSH_TO_TALK_PIN", 23),
+            tts_interrupt_pin=_env_int("TTS_INTERRUPT_PIN", 16),
+            status_led_red_pin=_env_int("STATUS_LED_RED_PIN", 27),
             status_led_pin=_env_int("STATUS_LED_PIN", 25),
+            status_led_blue_pin=_env_int("STATUS_LED_BLUE_PIN", 17),
             microphone_mute_pin=(
                 int(microphone_mute_pin) if microphone_mute_pin else None
             ),
@@ -207,7 +213,13 @@ class Settings:
             raise ValueError(str(error)) from error
 
     def _validate_gpio_pins(self) -> None:
-        configured_pins = [self.push_to_talk_pin, self.status_led_pin]
+        configured_pins = [
+            self.push_to_talk_pin,
+            self.tts_interrupt_pin,
+            self.status_led_red_pin,
+            self.status_led_pin,
+            self.status_led_blue_pin,
+        ]
         configured_pins.extend(
             pin
             for pin in (self.microphone_mute_pin, self.speaker_mute_pin)
