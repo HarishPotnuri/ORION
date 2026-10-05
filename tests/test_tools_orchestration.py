@@ -353,6 +353,127 @@ class OrchestrationTests(unittest.TestCase):
             finally:
                 reminders.close()
 
+    def test_planner_authorizes_plural_reminders_and_system_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = PlanningModel(
+                json.dumps({"type": "tool", "name": "reminder", "arguments": {"action": "list"}}),
+                json.dumps({"type": "tool", "name": "system_status", "arguments": {}}),
+                json.dumps({"type": "final", "response": "No reminders. System is healthy."}),
+            )
+            system_status = FakeTool("system_status", ToolResult("System is healthy."))
+            reminders = ReminderManager.from_settings(settings)
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([system_status]), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle("List my reminders and show system status")
+
+                self.assertTrue(result.completed)
+                self.assertEqual(result.route.action, "multi_step")
+                self.assertEqual(len(system_status.calls), 1)
+                prompt = " ".join(message.content for message in model.calls[1][0])
+                self.assertIn("Tool reminder succeeded: []", prompt)
+                self.assertNotIn("not available", prompt)
+            finally:
+                reminders.close()
+
+    def test_reminder_title_with_connectors_does_not_initialize_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            model = ScriptedModel('{"type":"final","response":"unexpected"}')
+            reminders = ReminderManager.from_settings(settings)
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([]), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle(
+                    "Remind me tomorrow at 8 AM to check weather and news"
+                )
+
+                self.assertTrue(result.completed)
+                self.assertEqual(result.route.kind.value, "REMINDER")
+                self.assertEqual(model.calls, [])
+                self.assertEqual(reminders.list(status="pending")[0].title, "check weather and news")
+            finally:
+                reminders.close()
+
+    def test_planner_can_combine_existing_local_query_forms(self):
+        model = PlanningModel(
+            json.dumps({"type": "tool", "name": "system_status", "arguments": {}}),
+            json.dumps({"type": "tool", "name": "time", "arguments": {"action": "time"}}),
+            json.dumps({"type": "final", "response": "Memory is available. It is 1 PM."}),
+        )
+        system_status = FakeTool("system_status", ToolResult("Memory is available."))
+        time_tool = FakeTool("time", ToolResult("It is 1 PM."))
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([system_status, time_tool])
+        )
+
+        result = orchestrator.handle("How much free memory do I have and tell me the time")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.route.action, "multi_step")
+        self.assertEqual(len(system_status.calls), 1)
+        self.assertEqual(len(time_tool.calls), 1)
+
+    def test_planner_can_reschedule_then_add_grounded_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            reminders = ReminderManager.from_settings(settings)
+            reminder = reminders.create_from_request(
+                "Remind me tomorrow at 1 PM about project meeting"
+            )
+            model = PlanningModel(
+                json.dumps({"type": "tool", "name": "reminder", "arguments": {
+                    "action": "reschedule", "query": "project meeting", "when": "tomorrow at 3 PM",
+                }}),
+                json.dumps({"type": "tool", "name": "reminder", "arguments": {
+                    "action": "add_notes", "query": "project meeting", "notes": "bring test results",
+                }}),
+                json.dumps({"type": "final", "response": "I updated the time and notes."}),
+            )
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([]), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle(
+                    "Reschedule my project meeting reminder to tomorrow at 3 PM and add notes: bring test results"
+                )
+
+                self.assertTrue(result.completed)
+                stored = reminders.get(reminder.id)
+                self.assertEqual(stored.due_at.astimezone(ZoneInfo(settings.reminder_timezone)).hour, 15)
+                self.assertEqual(stored.notes, "bring test results")
+                self.assertEqual(len(model.calls), 3)
+                self.assertIn("Authorized tools:", model.calls[2][0][0].content)
+                self.assertIn("Never guess missing reminder", model.calls[2][0][0].content)
+            finally:
+                reminders.close()
+
+    def test_incomplete_reschedule_asks_without_changing_reminder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            reminders = ReminderManager.from_settings(settings)
+            reminder = reminders.create_from_request(
+                "Remind me tomorrow at 1 PM about project meeting"
+            )
+            model = ScriptedModel(json.dumps({
+                "type": "final", "response": "When should I move the project meeting reminder?",
+            }))
+            orchestrator = RequestOrchestrator(
+                settings, model, ToolRegistry([]), reminders=reminders
+            )
+            try:
+                result = orchestrator.handle("Reschedule my project meeting reminder")
+
+                self.assertTrue(result.completed)
+                self.assertIn("When should", result.response)
+                self.assertEqual(len(model.calls), 1)
+                self.assertEqual(reminders.get(reminder.id), reminder)
+            finally:
+                reminders.close()
+
     def test_incomplete_reminder_uses_model_to_ask_for_required_details(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")

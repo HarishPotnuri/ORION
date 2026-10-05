@@ -82,6 +82,24 @@ class RouterTests(unittest.TestCase):
                     RouteKind.LLM_REASONING,
                 )
 
+    def test_keeps_single_operations_with_connectors_on_fast_paths(self):
+        cases = (
+            ("Remind me tomorrow at 8 AM to check weather and news", RouteKind.REMINDER),
+            ("Show system status and available memory", RouteKind.LOCAL_TOOL),
+            ("Remember that I check the weather and news", RouteKind.MEMORY_UPDATE),
+            ("Search for weather and news", RouteKind.ONLINE_FACTUAL_LOOKUP),
+            ("Check the weather in Trinidad and Tobago", RouteKind.ONLINE_FACTUAL_LOOKUP),
+        )
+        for request, expected_kind in cases:
+            with self.subTest(request=request):
+                self.assertEqual(self.router.route(request).kind, expected_kind)
+
+    def test_routes_compound_local_questions_to_planner(self):
+        decision = self.router.route("What time is it and what is the system status?")
+
+        self.assertEqual(decision.kind, RouteKind.LLM_REASONING)
+        self.assertEqual(decision.action, "multi_step")
+
     def test_routes_memory_and_online_requests(self):
         self.assertEqual(
             self.router.route("What did we decide about Orion's memory?").kind,

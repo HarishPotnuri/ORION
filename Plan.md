@@ -2,9 +2,9 @@
 
 ## Goal
 
-Build ORION as a privacy-first, local-first personal voice assistant for Raspberry Pi 5 with 8 GB RAM. The product should provide reliable push-to-talk interaction, local speech recognition, local model reasoning, local speech output, persistent reminders, and user-controlled memory.
+Build ORION as a privacy-first, offline-by-default personal voice assistant for Raspberry Pi 5 with 8 GB RAM and Raspberry Pi OS Lite 64-bit. The target product provides wake-word-only interaction, local speech recognition, streamed local model responses and speech output, persistent reminders, and user-controlled memory. The existing push-to-talk deployment remains the baseline until the replacement profile passes target validation.
 
-The architecture foundation and voice-service integration are implemented in the repository. Remaining work is target validation: verify deployment and behavior on the Raspberry Pi, measure resource use, then decide whether further agent planning is warranted.
+The architecture foundation, voice-service integration, and initial Phase 12 hybrid planner are implemented. Remaining work includes the open Phase 9-11 validation gates and the agreed Phase 13-16 offline-stack migration. Broader persistent memory and optional semantic retrieval are deferred to Phases 17 and 18.
 
 ## Product and Engineering Principles
 
@@ -19,9 +19,11 @@ The architecture foundation and voice-service integration are implemented in the
 - Keep all tool authorization, input validation, side effects, and online-data boundaries in deterministic code.
 - Keep planner scope narrow. Add tool actions only when they solve a demonstrated user request.
 
-## Current Status (September 2026)
+## Current Status (2026-10-06)
 
-Phases 1 through 8 are implemented in code. Typed CLI requests and the module-level tests provide a useful development path. Pi installation, audio/GPIO behavior, performance, and thermal behavior remain unverified.
+Phases 1 through 8 and the initial Phase 12 planner slice are implemented. The existing Pi deployment runs Ollama with `qwen3:1.7b`, VOSK, KittenTTS, GPIO23 push-to-talk, GPIO16 speech interruption, SQLite, and the integrated systemd service. The 2026-10-05 deployment update records working multi-turn voice interaction and passing installed-runtime tests. Initial resource captures exist. Fresh-image installation, reboot/reminder recovery, wake-word acoustics, and sustained thermal/performance acceptance remain open. Phases 13-18 below are planned, not implemented or Pi-verified.
+
+The phase descriptions for Phases 1-12 document the baseline implementation and its original requirements. The Phase 13+ target decisions supersede the earlier push-to-talk/fallback and resident-model requirements when the new profile is promoted; they do not claim those changes are already deployed.
 
 Status terms in this plan:
 
@@ -229,7 +231,7 @@ Acceptance criteria:
 - Repeated voice interactions complete without unbounded memory growth, stuck audio, model crashes, or missed reminder delivery.
 - Model/backend choice is supported by recorded Pi measurements; unverified alternatives remain labeled unverified.
 
-### Phase 12: Bounded Hybrid Routing and Tool Planning — Initial Slice Implemented
+### Phase 12: Bounded Hybrid Routing and Tool Planning - Implemented Locally; Pi Validation Pending
 
 Use deterministic code for recognizable, complete commands. Use the local model as planner for compound requests and for supported operations that lack required details. The model selects registered tools; deterministic adapters validate every argument and perform every side effect.
 
@@ -245,11 +247,121 @@ Use deterministic code for recognizable, complete commands. Use the local model 
 
 Implementation status: The router sends recognized compound requests to the bounded agent. Simple complete commands retain deterministic fast paths. Incomplete reminder creation/reschedule falls back to local clarification/planning. The agent can sequence allowed weather/search/local tools with the request-scoped reminder tool. Reminder mutations require explicit matching user intent; reminder fields and factual lookup queries are checked against the original request. Tests cover weather-plus-reminder planning, incomplete reminders, rejected unrequested actions, grounded factual queries, and existing fast-path regressions. Initial operation-cue detection is intentionally conservative and may miss natural-language combinations; broaden it only with regression examples. Multi-step memory tools, calendar/device actions, and model-originated irreversible actions remain out of scope.
 
+Local implementation update (2026-10-06): Compound recognition now requires an operation clause after a connector instead of counting overlapping keywords. Reminder titles, saved facts, search topics, and location names containing conjunctions retain their deterministic handling. Compound local questions use the planner; request-scoped authorization recognizes plural reminders and the existing time/date/system-status query forms. Initial planner instructions and authorized-tool descriptions survive every tool step while only the latest step state replaces the previous state. Added regressions cover these failures, reschedule-plus-notes sequencing, and incomplete reschedule clarification without mutation. Focused Phase 12 checks passed 78 tests and 29 subtests; the full Windows Python 3.11.9 suite passed 150 tests and 42 subtests. This update has not been deployed or measured on the Pi. Phase 13 runtime/default changes remain planned, not implemented.
+
 Acceptance criteria:
 
 - Every enhancement addresses a documented failure/use case and has focused regression tests.
 - Existing privacy, local-only model, network allowlist, deterministic fast path, and time/resource limits remain covered by tests.
 - Pi memory/latency remain within the baseline budget after each feature is added.
+
+## Offline Stack Migration: Phases 13-18
+
+### Current Behavior Versus Target Requirements
+
+- LLM settings default to `llama.cpp`, no local model path, `qwen3:1.7b` as the model label, 8192 context tokens, a 6000-token estimated input budget, and four threads. The deployed environment selects Ollama instead. Neither adapter currently streams; a model label alone does not verify a GGUF artifact.
+- `LocalModel.complete`, `SpeechOutput.speak`, loopback-only transport, managed llama.cpp ownership, deterministic routes, and bounded structured tool decisions already exist. Extend these boundaries rather than adding an agent or plugin framework.
+- Capture already uses bounded 16 kHz mono int16 PCM and RMS VAD. Activation and transcription are coupled through `WakeWordInput` inheriting `VoskTranscriber`; startup warms STT/TTS, and VOSK loads before consuming VAD. Separate utterance collection from transcription so silence never loads Whisper.
+- openWakeWord is optional and defaults to `hey_jarvis`. The target requires a custom local "Hey Orion" model, wake-word-only activation, and independent lightweight listening. Existing capture blocks are 320 samples; assemble bounded 1280-sample frames for 80 ms wake inference at 16 kHz.
+- Bounded recent turns, relevant SQLite/FTS5 retrieval, facts/preferences/decisions/episodes, reminders, sensitive-data checks, and Incognito already exist. Generated summaries, general tasks, broader device/configuration state, and embeddings are new, deferred requirements. Separate tables for existing facts/preferences are not required merely to rename their categories.
+- KittenTTS currently waits for the complete response. Piper and early phrase playback require new adapters and a streamed orchestration path, not only a model-name change.
+- Stage timers and `scripts/phase11-capture.sh` already exist. Wake timing, LLM TTFT/token rate, first audible output, turn correlation, and provider-independent resource attribution need extension.
+- The current tool factory registers weather without a global online opt-in setting. Add an explicit default-off gate for both weather and search; existing HTTPS allowlists alone do not enforce offline-by-default behavior.
+
+### Confirmed Target Profile and Controls
+
+- Preserve Phase 12. Implement the runtime migration as Phases 13-16; promote code and deployment defaults together after Pi validation.
+- Use Qwen3.5-2B post-trained weights converted to GGUF `Q4_K_M` with a pinned compatible `llama.cpp` build. Run text-only without a vision projector. Use non-thinking mode initially; do not assume Qwen3 `/nothink` or Ollama-specific flags apply to this runtime.
+- Use `whisper.cpp` with local Whisper `base.en` for the initial English profile. Allow `base` selection for a separately validated multilingual profile.
+- Use Piper with local medium-quality English ONNX/config assets. `en_US-lessac-medium` is an initial candidate, subject to voice selection and license verification. Use the voice's metadata sample rate and preserve hardware playback resampling.
+- Use openWakeWord with custom "Hey Orion" assets. Provision or train the model on a development machine, not the Pi. Package the custom model and feature-extractor assets locally, record hashes/licenses, and verify acoustic behavior. Missing assets block release; never silently substitute another phrase or download models at startup.
+- Remap the existing GPIO23 button to debounced microphone mute/unmute without rewiring. Wake word becomes the only voice activation mode; no push-to-talk fallback remains in the target profile. GPIO16 retains speech interruption and cancels remaining streamed generation/output.
+- Persist microphone mute across restart/reboot. Mute stops capture, cancels/discards active input, clears audio/detector state, and prevents stale transcripts from dispatching. Speaker and reminders remain active; already-dispatched actions are not undone. Read mute state before opening capture. A new installation starts unmuted; unreadable/corrupt state fails closed. Report persistence errors without claiming a successful durable unmute.
+- Preserve the existing RGB LED wiring. `MUTED` takes precedence over normal status transitions. Privacy mute and playback suppression are separate states. Listen continuously while unmuted, except intentional playback suppression to avoid self-activation; voice barge-in/echo cancellation is out of scope.
+- Keep Ollama, VOSK, and KittenTTS selectable for explicit benchmarking/rollback. Do not silently change providers, re-enable PTT, add cloud fallback, or run duplicate LLM backends.
+- Continue using SQLite and compact relevant retrieval. Broader memory features remain deferred; the small persistent microphone-control record is the immediate device-state exception.
+
+### Phase 13: Configurable Adapters and Wake-Word Input - Planned
+
+1. Extend existing contracts/factories with explicit STT/TTS providers, local artifact paths, language, per-provider threads, cancellation, and cleanup. Decouple activation/VAD from transcription. Keep settings validated and configuration/route checks free of heavy model initialization.
+2. Add a default-off online-tools flag. Gate deterministic and planner weather/search consistently while preserving exact-host HTTPS policy when enabled. Downloads/builds are explicit installation operations only.
+3. Add a small additive SQLite control-state record and GPIO23 mute handling with debounce, fail-closed reads, reliable capture close/restart, and stale-input rejection. Preserve GPIO16 and pin-conflict validation; an old PTT setting may serve only as a deprecated wiring alias, not an activation mode.
+4. Add an independent bounded wake listener, 80 ms frame accumulation, reset behavior, and local "Hey Orion" artifact validation. Keep detection lightweight during model activity and suppress playback leakage. Spoken confirmations still require wake activation and a clear affirmative within the existing 15-second timeout; muted input cannot confirm a mutation.
+5. Collect a bounded nonempty voiced utterance through VAD before starting Whisper. Prefer an owned per-utterance `whisper-cli` subprocess with an in-memory WAV over stdin, transcript stdout, explicit CPU threads/no GPU, bounded output, deadlines, cancellation, and guaranteed process cleanup. Pin and prove stdin support; enable no output-file options. Measure reload cost before considering a resident worker.
+
+Acceptance criteria:
+
+- No wake, silence, or microphone mute activates STT/LLM; deterministic local requests still bypass the LLM.
+- GPIO23 toggles once per press, mute survives restart, stale audio never resumes, and reminders/speaker remain functional while muted.
+- Missing local assets fail clearly without network access or alternate-provider/phrase fallback. Captured audio never reaches disk.
+- Mocked wake-to-VAD-to-transcript integration, cancellation, error cleanup, and existing privacy/tool tests pass.
+
+Dependency: adapter/capture separation precedes mute, wake, and Whisper integration. Offline gating and artifact preparation can proceed in parallel after the contracts are defined.
+
+### Phase 14: Qwen Runtime and Safe Streaming Generation - Planned
+
+1. Select and checksum the actual Qwen3.5-2B `Q4_K_M` GGUF, not the Base variant, and pin/smoke-test its llama.cpp build and chat template. Start with 4096 context tokens, a 3072-token input budget, up to 512 answer tokens, and 512 tokens reserved for template/safety overhead. Validate formatted prompt plus output capacity through the runtime tokenizer/template path. Allow 8192 only after validation. Keep the planner cap separately bounded, initially 128 tokens.
+2. Add typed streaming events and policy-preserving SSE transport with incremental UTF-8/event decoding, response bounds, finish/`[DONE]` handling, usage/timings, absolute deadlines, cancellation, and connection cleanup. Retain `complete()` for buffered consumers and rollback adapters. Reject remote endpoints, redirects, and hidden cloud fallback.
+3. Buffer and schema-validate tool/control decisions before execution. For streaming requests with authorized tools, finish bounded planning using tool/respond decisions, then stream a tools-disabled final answer. Tool-free reasoning can stream directly without an extra planner call. Preserve existing argument grounding, confirmations, deadlines, step limits, and repeated-action protection. Never speak planner JSON, tool arguments, memory suggestions, or reasoning channels.
+4. Reuse `ContextBuilder`, bounded recent turns, memory retrieval, and orchestrator recording. Commit successful streamed text once. For interruption/failure, retain only delivered text with explicit incomplete status, not unsaid continuation or fabricated success. Never retry after audible output begins or save aborted-response memory suggestions automatically.
+
+Acceptance criteria:
+
+- Local streams decode correctly across arbitrary byte splits, malformed/truncated events, Unicode boundaries, and cancellation.
+- Partial tool JSON never causes a side effect or reaches speech/history. All existing tool/privacy limits remain covered.
+- Prompt/output budgets are enforced, structured output works with the selected artifact, and reasoning content never reaches user output/history.
+
+Dependency: Phase 13 contracts and artifact provisioning precede this phase. Streaming transport and Piper adapter preparation can proceed in parallel; streamed orchestration depends on the transport.
+
+### Phase 15: Piper and Streamed Voice Delivery - Planned
+
+1. Select Piper through the shared factory for voice-check, voice service, and reminder service. Load local ONNX/config only for first speech, set CPU inference threads explicitly, and play iterable synthesized audio chunks using the existing resampling/interruptible playback patterns.
+2. Extend orchestration with user-facing text events and bounded sentence/phrase accumulation. Handle punctuation, decimals, abbreviations, long punctuation-free text, Unicode, and final tails. Start synthesis/playback on the first complete phrase before generation finishes. Bound phrase size and text/audio queues; use backpressure.
+3. Serialize reminder and conversational speech through one playback coordinator. Keep capture/detection suppressed across the entire speaking session, including gaps between chunks. GPIO16 cancels remaining generation/playback and flushes queues. Shutdown remains responsive while muted or blocked and joins workers/stops owned processes.
+4. Remove unconditional STT/TTS warmup. Add configurable owned LLM/Piper idle eviction, initially 60 seconds and subject to measurement. Never evict an active turn or terminate an externally managed server. Whisper exits after each utterance; wake detection remains resident. Keep one LLM backend active.
+
+Acceptance criteria:
+
+- Fake-stream/audio tests prove first playback occurs before generation completes, without duplicate speech or unbounded buffering.
+- Interruptions discard queued output; no stale chunks resume. Playback suppression prevents self-transcription between phrases.
+- Reminder speech remains serialized and recoverable; adapter failures and shutdown leave no owned processes/workers active.
+
+Dependency: Piper adapter work can begin after Phase 13 contracts. Integrated streamed playback depends on Phase 14 and the Piper adapter.
+
+### Phase 16: Metrics, Pi Validation, and Default Promotion - Planned
+
+1. Add turn-correlated instrumentation while building Phases 13-15, then complete wake inference/detection timing, VAD end-of-speech, STT load/inference, LLM load/TTFT/tokens per second/total, first phrase, TTS synthesis/first playback, speech-end-to-first-audio, and total response completion metrics. Exclude indefinite wake waiting from processing latency. Use backend token usage/timings, not character counts as tokens.
+2. Extend the Phase 11 capture script to identify selected runtimes and owned process trees. Sample RSS/CPU, available RAM, CPU temperature, throttling, and swap at bounded intervals. Unsupported sensors report unavailable, not zero. Performance logs exclude audio/transcript/reasoning content by default.
+3. Pin builds, dependencies, model hashes, and licenses. Verify Piper distribution requirements and individual voice/wake-model licenses. Compare thread settings 1, 2, 3, and 4 under combined LLM/TTS load; cap runtime pools to avoid oversubscription. Record identical prompts/audio, context, quantization, cooling, power, and ambient conditions.
+4. Complete disconnected cold boot, idle/cold/repeated-turn captures, a 30-minute soak, reboot, reminder recovery, wake false accepts/rejects, playback leakage, mute persistence, and output-rate compatibility on the Pi. Compare explicit baseline/candidate profiles one component at a time before combined load. Reuse Phase 9-11 gates rather than declaring them complete from laptop tests.
+5. Prove installation on a fresh Raspberry Pi OS Lite 64-bit image with the unprivileged systemd account, correct GPIO/audio permissions, writable SQLite, and read-only provisioned models. No runtime downloads, GPU dependencies, or swap tuning are introduced.
+6. Promote `Settings`, deployment environment, dependency profiles, README, this plan, and issue status together after acceptance. Keep existing data and explicit runtime rollback selectors. If a gate fails, leave current defaults unchanged and report the blocked criterion.
+
+Acceptance criteria:
+
+- The requested roughly 2-3 GB LLM RSS is a benchmark target, not a verified guarantee. Proposed release guard: at least 1 GiB available system RAM throughout peak/soak workloads, no swap growth or thermal throttling, bounded worker/process counts, no stuck audio, and no missed/duplicate reminder delivery.
+- The complete provisioned workflow works without external network access. Weather/search refuse operation until explicitly opted in.
+- Measured latency, answer quality, wake accuracy, native build compatibility, and release limits are published. No numerical latency promise is invented from model size or laptop mocks.
+
+Dependency: instrumentation starts during adapter implementation; integrated measurements and promotion require Phases 13-15. Independent laptop implementation may proceed while Phase 9-11 hardware gates remain open. Default promotion is the final migration step.
+
+### Phase 17: Broader Persistent Memory - Deferred
+
+Define concrete use cases and acceptance before implementation. Reuse SQLite preferences/facts/reminders and FTS5. Add bounded conversation summaries, general task storage/tools, and allowlisted non-secret device/configuration state through additive versioned schema changes with rollback proof. Summaries obey Incognito/sensitive-data policy, retain provenance, and never override authoritative facts. Keep runtime configuration in `Settings` unless a specific feature needs persistence; never store secrets or the entire conversation/database in prompts.
+
+Acceptance: existing data/readers remain usable, summaries/tasks/state have focused tests, retrieval stays bounded, and privacy/deletion rules survive migration. Do not start automatically after Phase 16.
+
+### Phase 18: Optional Semantic Retrieval - Deferred
+
+Require documented lexical-retrieval failures before adding embeddings. Select and pin a small local CPU-friendly model using Pi RAM/latency and retrieval-quality measurements. Store vectors and their model version/dimensions in SQLite initially. Generate only during memory save/search, bound input/results, honor deletion and Incognito, and retain lexical fallback. No separate vector service, continuous embedding activity, or unsolicited background re-embedding is required. Embeddings remain disabled by default.
+
+### Migration Verification and Handoff
+
+- Extend `config.py`, `core/contracts.py`, and `app.py` for provider selection, controls, streaming, and owned lifecycle. Reuse the audio capture/VAD/gate/playback code, `llm/runtime.py`, agent/orchestrator/context, SQLite managers, tools factory, and network policy. Add focused adapter/coordinator modules only where ownership requires them.
+- Add focused regressions in the existing config/audio/voice-service tests and runtime/agent-context/tools/memory/reminder tests. Run `python -m pytest tests/test_config.py tests/test_audio.py tests/test_voice_service.py -q` for input/control work and `python -m pytest tests/test_router_runtime.py tests/test_agent_context.py tests/test_tools_orchestration.py -q` for generation/planning. Use the selected interpreter or `scripts/test-local.ps1`; run the full suite before deployment.
+- Test offline gates, missing/corrupt artifacts, Whisper stdin without output files, subprocess cancellation, persistent mute failures, malformed SSE, tool authorization, Incognito, bounded streaming queues, reminder serialization, and shutdown cleanup. Inspect SQLite and prove existing-reader rollback without destructive migrations.
+- Preserve recorded Phase 9-11 baseline evidence and update README, deployment files, dependencies/locks, capture scripts, and Issues.md only as the corresponding implementation/validation lands.
+- Stop the migration after Phase 16 acceptance and documented promotion. Artifact, licensing, or hardware blockers leave the candidate opt-in; broader memory and semantic retrieval need separate approval.
 
 ## Verification Checklist
 
@@ -268,7 +380,7 @@ Acceptance criteria:
 ### Raspberry Pi release checks
 
 - Clean installation succeeds on the documented OS/Python/dependency profile.
-- Microphone, VOSK, speaker, KittenTTS, GPIO, local model runtime, SQLite, and systemd behavior are verified on the target setup.
+- Microphone, selected STT/TTS adapters, speaker, GPIO, local model runtime, SQLite, and systemd behavior are verified on the target setup; baseline evidence does not verify replacement runtimes.
 - Speech playback cannot be transcribed as new user input; VAD works in the intended acoustic environment.
 - Voice and reminder service run under the documented unprivileged account and recover across reboot/restart.
 - Peak memory, CPU, latency, temperature, throttling, and sustained-session behavior are recorded.
@@ -289,7 +401,7 @@ Before Pi release, resolve and document:
 - Physical button/LED/mute wiring and which controls are actually implemented.
 - Whether online weather/search are enabled in the deployment and which provider hosts receive queries.
 
-Use resource-conscious defaults, but label RAM and latency expectations as estimates until measured on the Pi. Keep wake-word detection disabled by default until its CPU use and acoustic performance have been measured.
+Use resource-conscious defaults, but label RAM and latency expectations as estimates until measured on the Pi. The current deployment keeps wake-word detection disabled. The Phase 13+ target uses wake-word-only activation after custom-model, privacy-control, CPU, and acoustic validation; promote it with the complete replacement profile in Phase 16.
 
 ## Confirmed Product Decisions
 
@@ -299,23 +411,25 @@ Use resource-conscious defaults, but label RAM and latency expectations as estim
 - Store selected memories and reminders in SQLite; keep recent turns volatile and bounded; never persist raw microphone audio by default.
 - Explicit user memory requests and policy-screened model suggestions are allowed, subject to Incognito and sensitive-data rules.
 - Default reminder timezone is `Asia/Kolkata`; recover missed reminders after service downtime.
-- Use Open-Meteo for weather and operator-configured SearXNG for factual web/news search. Search remains disabled until exact HTTPS host configuration is present.
-- Start with push-to-talk. Wake-word detection is optional and disabled by default until tested on target hardware.
+- Retain Open-Meteo and operator-configured SearXNG only as explicitly opted-in factual tools. Add a default-off gate for both during Phase 13; search also requires exact HTTPS host configuration.
+- The current deployment uses push-to-talk. The agreed target uses only "Hey Orion" wake activation, remaps GPIO23 to persistent microphone mute/unmute without rewiring, and retains GPIO16 speech interruption. Microphone mute does not silence reminders or speaker output.
+- Promote Qwen3.5-2B GGUF `Q4_K_M`/llama.cpp, Whisper `base.en`/whisper.cpp, and Piper medium-English as defaults only after Phase 16 validation. Keep existing runtime adapters selectable for explicit rollback, not automatic fallback.
+- Defer summaries, general tasks, broader device state, and optional embeddings to Phases 17-18. Persist microphone mute in the initial migration as a narrow control-state exception.
 - No Docker, cloud LLM fallback, second routing LLM, or unbounded audio/conversation history.
 
 ## Known Limits
 
-- End-to-end voice flow is implemented but not verified with microphone, speaker, and GPIO hardware.
-- The Pi installation and the compatibility of the pinned Python/dependency set on the target OS are unverified.
-- Audio hardware, VOSK/TTS coexistence, GPIO behavior, wake-word behavior, CPU, memory, thermal, latency, and long-running stability have not been measured on the Pi.
+- The existing Pi has passed basic audio/GPIO checks, installed-runtime tests, systemd launch/restart, and user-confirmed multi-turn voice use. Fresh-image installation and reboot/reminder recovery remain unverified.
+- Initial idle/interactive resource and stage-latency captures exist; cold-start peaks, 30-minute soak, sustained thermal behavior, and acoustic acceptance remain open.
+- Qwen3.5 GGUF/llama.cpp, Whisper, Piper, custom "Hey Orion", persistent GPIO23 mute, and streamed speech are planned replacements, not implemented or Pi-verified. The 2-3 GB LLM RAM target is unverified.
 - The current README includes older setup/model guidance and must be reconciled with the verified packaged runtime before release.
 - The current llama.cpp and Ollama deployment modes and structured-output reliability need validation on the chosen Pi configuration.
-- The plan mentions a `systemd/orion.service`, but a production-ready integrated service and controls remain to be delivered.
+- The integrated systemd service and existing PTT/interrupt/RGB controls are deployed. The new mute mapping, wake-only activation, and replacement-runtime lifecycle still require implementation and target validation.
 - Incognito is process-local and resets on restart; its intended user-facing promise must be finalized for a persistent service.
 - A trusted SearXNG instance must be configured before web search is available. Search queries and weather locations are sent to their configured providers.
 
 ## Immediate Milestone and Handoff
 
-Phase 8 and the initial Phase 12 planner slice are implemented in code and covered by local tests. Next milestone is Phase 9: install the documented stack on a clean Raspberry Pi OS image and close dependency/runtime compatibility gaps. Then complete deployment and measured validation. Expand planner tools only for concrete, tested user needs and retain execution safeguards.
+Phase 8 and the initial Phase 12 planner slice remain implemented. The next implementation milestone is Phase 13: adapter/capture separation, explicit offline gating, custom wake activation, persistent microphone controls, and Whisper integration. Keep the current deployment unchanged while developing the candidate. Complete the open Phase 9-11 installation/reboot/soak gates alongside target validation, then promote the replacement defaults only at Phase 16. Do not start Phases 17-18 automatically or broaden planner tools without concrete tested needs.
 
 For an implementation agent, work phase by phase. Before editing, inspect the current code and tests; implement only the active phase, add or update focused tests, run the relevant local checks, and report which acceptance criteria passed. Do not mark Pi-specific criteria complete from laptop results. Preserve uncommitted user changes and do not make unrelated cleanup changes.

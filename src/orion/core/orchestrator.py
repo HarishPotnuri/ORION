@@ -250,11 +250,11 @@ class RequestOrchestrator:
             allowed.add("weather")
         if re.search(r"\b(?:search|look up|lookup|browse|current|latest|recent|news|headlines)\b", normalized):
             allowed.add("web_search")
-        if re.search(r"\b(?:what time|current time|time now|date|what day|today)\b", normalized):
+        if self.router._time_queries.search(normalized) or self.router._date_queries.search(normalized):
             allowed.add("time")
-        if re.search(r"\b(?:system|device|memory|disk|storage)\b.{0,30}\b(?:status|health|free|available)\b", normalized):
+        if self.router._system_queries.search(normalized):
             allowed.add("system_status")
-        if self.reminders is not None and re.search(r"\b(?:reminder|remind me)\b", normalized):
+        if self.reminders is not None and re.search(r"\b(?:reminders?|remind me)\b", normalized):
             allowed.add("reminder")
         allowed.intersection_update(self.tools.names() + (("reminder",) if self.reminders is not None else ()))
         return tuple(sorted(allowed))

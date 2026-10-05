@@ -182,6 +182,27 @@ class AgentControllerTests(unittest.TestCase):
         self.assertFalse(tool.cancel_event.is_set())
         self.assertTrue(any("Found compact data." in message.content for message in model.calls[1][0]))
 
+    def test_preserves_planner_guidance_after_each_tool_step(self):
+        model = ScriptedModel(
+            tool_call(arguments={"query": "first"}),
+            tool_call(arguments={"query": "second"}),
+            final(),
+        )
+        tool = FakeTool()
+        guidance = "Authorized tools: lookup. Ask for clarification; never guess missing details."
+
+        result = self.controller(model, tool).run(
+            "Look up first and then second", initial_task_state=guidance
+        )
+
+        self.assertTrue(result.completed)
+        for index, (messages, _tokens) in enumerate(model.calls):
+            with self.subTest(step=index):
+                self.assertIn(guidance, messages[0].content)
+                if index:
+                    self.assertIn(f"Step {index}: called lookup; result succeeded.", messages[0].content)
+        self.assertNotIn("Step 1:", model.calls[2][0][0].content)
+
     def test_does_not_pass_extra_reasoning_field_to_tool(self):
         model = ScriptedModel(
             tool_call(

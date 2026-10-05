@@ -209,7 +209,10 @@ class AgentController:
             compact_result = self._compact_result(result.content)
             status = "succeeded" if result.success else "failed"
             tool_results.append(f"Tool {name} {status}: {compact_result}")
-            task_state = f"Step {step}: called {name}; result {status}."
+            task_state = (
+                f"Initial task state:\n{initial_task_state}\n\n"
+                f"Step {step}: called {name}; result {status}."
+            )
 
         return self._limit_result(self.settings.max_agent_steps, "max_steps")
 

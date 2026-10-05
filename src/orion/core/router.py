@@ -36,6 +36,14 @@ class OrionRouter:
         re.compile(r"\b(?:weather|forecast|news|latest|current)\b"),
         re.compile(r"\b(?:remember|forget|save|delete memory)\b"),
         re.compile(r"\b(?:time|date|day)\b"),
+        re.compile(r"\b(?:system|device)\s+(?:status|health)\b"),
+    )
+    _operation_start = re.compile(
+        r"^(?:please\s+)?(?:"
+        r"search|look up|lookup|browse|check|find|show|list|tell|compare|"
+        r"remind me|set|create|schedule|cancel|delete|remove|reschedule|move|shift|"
+        r"change|modify|update|add|edit|remember|forget|save|recall|"
+        r"what|which|when|how much|do i have|have i got)\b"
     )
     _simple_commands = (
         (re.compile(r"\b(mute yourself|be quiet|stop speaking|silence)\b"), "mute_speaker"),
@@ -139,13 +147,15 @@ class OrionRouter:
 
     @classmethod
     def _is_multi_step(cls, request: str) -> bool:
-        if not cls._multi_step_connectors.search(request):
-            return False
-        matching_operations = sum(
-            sum(1 for _match in pattern.finditer(request))
-            for pattern in cls._operation_cues
-        )
-        return matching_operations >= 2
+        for connector in cls._multi_step_connectors.finditer(request):
+            preceding = request[:connector.start()]
+            following = request[connector.end():].lstrip(" ,;:")
+            if cls._operation_start.match(following) and any(
+                pattern.search(preceding)
+                for pattern in (*cls._operation_cues, cls._system_queries)
+            ):
+                return True
+        return False
 
     @staticmethod
     def _reminder_action(request: str) -> str:
