@@ -2,7 +2,6 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $root ".venv-local\Scripts\python.exe"
-$orion = Join-Path $root ".venv-local\Scripts\orion.exe"
 $databaseId = [guid]::NewGuid().ToString("N")
 $database = Join-Path ([System.IO.Path]::GetTempPath()) "orion-local-test-$databaseId.sqlite3"
 $previousDatabasePath = $env:ORION_DATABASE_PATH
@@ -24,22 +23,22 @@ try {
     }
 
     $env:ORION_DATABASE_PATH = $database
-    & $orion --check-config
+    & $python -m orion --check-config
     if ($LASTEXITCODE -ne 0) {
         throw "ORION configuration check failed."
     }
 
-    & $orion --request "What time is it?"
+    & $python -m orion --request "What time is it?"
     if ($LASTEXITCODE -ne 0) {
         throw "Local time request failed."
     }
 
-    & $orion --request "Remind me tomorrow at 1 PM about ORION laptop test"
+    & $python -m orion --request "Remind me tomorrow at 1 PM about ORION laptop test"
     if ($LASTEXITCODE -ne 0) {
         throw "Reminder creation request failed."
     }
 
-    & $orion --request "What reminders do I have today?"
+    & $python -m orion --request "What reminders do I have today?"
     if ($LASTEXITCODE -ne 0) {
         throw "Reminder persistence request failed."
     }

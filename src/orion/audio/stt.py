@@ -47,6 +47,34 @@ class VoskTranscriber:
     def warmup(self) -> None:
         self._load_model()
 
+    def validate_assets(self) -> None:
+        if not Path(self.settings.stt_model_path).is_dir():
+            raise FileNotFoundError("VOSK model directory not found")
+
+    def transcribe(self, pcm: bytes, *, cancel_event: threading.Event, timeout=None) -> str:
+        if not pcm or cancel_event.is_set():
+            return ""
+        deadline = time.monotonic() + (self.settings.stt_timeout if timeout is None else timeout)
+        recognizer_factory = self._recognizer_factory
+        if recognizer_factory is None:
+            from vosk import KaldiRecognizer
+
+            recognizer_factory = KaldiRecognizer
+        recognizer = recognizer_factory(self._load_model(), self.settings.audio_sample_rate)
+        block_bytes = self.settings.audio_block_frames * 2
+        for offset in range(0, len(pcm), block_bytes):
+            if cancel_event.is_set():
+                return ""
+            if time.monotonic() >= deadline:
+                raise TimeoutError("VOSK transcription timed out")
+            recognizer.AcceptWaveform(pcm[offset:offset + block_bytes])
+        if cancel_event.is_set():
+            return ""
+        return str(json.loads(recognizer.FinalResult()).get("text", "")).strip()
+
+    def close(self) -> None:
+        self._model = None
+
     def _load_model(self):
         if self._model is None:
             if not Path(self.settings.stt_model_path).is_dir():
@@ -165,9 +193,10 @@ class PushToTalkInput(VoskTranscriber):
 
 
 class WakeWordInput(VoskTranscriber):
-    def __init__(self, settings: Settings, detector, **kwargs):
+    def __init__(self, settings: Settings, detector, *, on_wake=None, **kwargs):
         super().__init__(settings, **kwargs)
         self.detector = detector
+        self.on_wake = on_wake
 
     def next_utterance(self, timeout: float | None = None) -> str:
         turn_stop, timer = self._turn_stop(timeout)
@@ -183,6 +212,8 @@ class WakeWordInput(VoskTranscriber):
                     continue
                 if self.detector.detected(chunk):
                     logger.info("Wake word detected")
+                    if self.on_wake is not None:
+                        self.on_wake()
                     return self.transcribe_chunks(chunks, turn_stop)
             return ""
         finally:

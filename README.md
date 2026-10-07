@@ -2,8 +2,8 @@
 
 ### Clear Conversation History
 
-Say "clear conversation history" through PTT to reset recent conversation context without restarting the voice service. "Clear chat history", "reset our conversation", and "wipe conversational memory" also work. The command runs without model inference and leaves saved facts, preferences, decisions, episodes, and reminders unchanged. Neither the command nor its acknowledgement enters the new conversation history. This does not correct speech recognition or remove misunderstandings already saved as durable memories.
-Local voice assistant running on Raspberry Pi 5 powered by VOSK STT, local LLM (llama.cpp or Ollama), and KittenTTS
+After wakeword activation, say "clear conversation history" to reset recent conversation context without restarting the voice service. "Clear chat history", "reset our conversation", and "wipe conversational memory" also work. The command runs without model inference and leaves saved facts, preferences, decisions, episodes, and reminders unchanged. Neither the command nor its acknowledgement enters the new conversation history. This does not correct speech recognition or remove misunderstandings already saved as durable memories.
+Local voice assistant running on Raspberry Pi 5 with custom wakeword activation, Whisper STT, local LLM (llama.cpp or Ollama), and KittenTTS
 
 ## ORION local tools
 
@@ -78,17 +78,39 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv python install 3.12
 uv venv --python 3.12 .venv-voice
-UV_PROJECT_ENVIRONMENT=.venv-voice uv sync --locked --extra voice --extra pi --extra test --python 3.12
+UV_PROJECT_ENVIRONMENT=.venv-voice uv sync --locked --extra voice --extra wakeword --extra pi --extra test --python 3.12
 source .venv-voice/bin/activate
 ```
 
 `uv.lock` records the exact dependency resolution; use `uv sync --locked` so updates cannot silently change the tested profile. `uv venv` does not install pip by default. If `uv` is not on PATH, run it as `"$HOME/.local/bin/uv"`. The direct KittenTTS wheel URL in the `voice` extra is intentional: uv-only source configuration is ignored by pip and allowed an unrelated PyPI package to be installed previously. The uv config excludes only `spacy-curated-transformers` from Misaki 0.9.4: KittenTTS's path does not import it, and it pulls in Torch's CUDA 13 dependencies, including a wheel built for SBSA rather than Raspberry Pi aarch64. The clean Pi voice install and offline synthesis were verified without that package.
 
-Install `wakeword` only if testing wake-word input:
+The default and deployed profile remains legacy/VOSK until verified wake-word assets are available. Install wake-word dependencies only when preparing a controlled candidate:
 
 ```sh
 uv pip install -e '.[voice,pi,wakeword,test]'
 ```
+
+### Phase 13 wake-word profile
+
+The candidate profile uses custom `Hey Orion` activation and Whisper `base.en`. Startup requires one compatible wake classifier, its matching openWakeWord melspectrogram and embedding ONNX models, a local `whisper-cli` build, the Whisper GGML model, and a provenance/checksum manifest. ORION validates ONNX tensor contracts and runtime compatibility before capture. It does not download or substitute models. Keep Hugging Face offline. Deployment scripts intentionally exclude model directories. See [Phase 13 artifact requirements](docs/phase13-artifacts.md) for exact interfaces and controlled migration with rollback.
+
+After provisioning all artifacts and validating the manifest on Pi, configure these in `/etc/orion/orion.env` for a controlled candidate test. Back up the file first and follow the documented rollback procedure:
+
+```ini
+ORION_VOICE_PROFILE=wakeword
+ORION_STT_BACKEND=whisper.cpp
+ORION_STT_MODEL_PATH=/opt/orion/models/whisper/ggml-base.en.bin
+ORION_WHISPER_CLI_PATH=/usr/local/bin/whisper-cli
+ORION_TTS_MODEL_PATH=/opt/orion/models/tts/kitten-tts-nano-0.2
+ORION_WAKE_WORD_MODEL_PATH=/opt/orion/models/wakeword/hey_orion.onnx
+ORION_WAKE_WORD_MELSPECTROGRAM_PATH=/opt/orion/models/wakeword/melspectrogram.onnx
+ORION_WAKE_WORD_EMBEDDING_PATH=/opt/orion/models/wakeword/embedding_model.onnx
+ORION_WAKE_WORD_MANIFEST_PATH=/opt/orion/models/wakeword/phase13-artifacts.json
+```
+
+In the candidate profile GPIO23 toggles persistent microphone mute/unmute; GPIO16 remains speech interruption. The microphone starts unmuted on a fresh database and retains its state across restarts. A muted or stale transcript cannot dispatch an action or confirm a mutation. Keep the service on `ORION_AUDIO_DEVICE="default"` unless another device has passed the configured sample-rate checks. Missing or incompatible assets fail validation before capture starts. VOSK remains active until the full set passes validation.
+
+`ORION_TTS_MODEL_PATH` is optional and points to a local KittenTTS ONNX model directory. If unset, the existing KittenTTS model identifier uses the pre-provisioned Hugging Face cache while runtime offline mode is enforced. A configured local directory never falls back to Hub access when its config or model files are missing.
 
 ### Download models and configure runtime
 
@@ -116,7 +138,7 @@ source "$HOME/.local/bin/env"
 source .venv-voice/bin/activate
 export ORION_STT_MODEL_PATH="$HOME/orion/models/vosk-model-small-en-us-0.15"
 export ORION_AUDIO_QUEUE_CHUNKS=100
-export ORION_AUDIO_DEVICE="Jabra EVOLVE 20 MS: USB Audio"
+export ORION_AUDIO_DEVICE="default"
 export ORION_MODEL_BACKEND=ollama
 export ORION_MODEL_BASE_URL=http://127.0.0.1:11434
 export ORION_MODEL_NAME=qwen3:1.7b
@@ -128,9 +150,9 @@ If `ollama pull` or ORION cannot reach Ollama, confirm its local service is acti
 
 ### Verify hardware and voice
 
-The tested Jabra EVOLVE 20 MS appears as a USB device with one input and two outputs. PortAudio supports its 16 kHz microphone capture and 32/44.1/48 kHz playback, but not KittenTTS's native 24 kHz; ORION's playback adapter must resample to the device default. Run `python -m sounddevice` to list devices. Increase the Jabra inline volume if the test tone or speech is faint.
+Use the ALSA `default` device for input and output unless a specific PortAudio device has been verified at ORION's configured rates. On the Pi, AIRHUG 01 appears as `AIRHUG 01: USB Audio (hw:0,0)` and accepts 48 kHz directly, but rejects ORION's 16 kHz capture and 24 kHz playback rates. ALSA `default` accepts both configured rates, and the user reports voice interaction appears to work with it. Confirm actual AIRHUG routing with real capture/playback before relying on the setup; earlier Jabra measurements do not validate AIRHUG 01.
 
-Default controls are push-to-talk on BCM GPIO23 (physical pin 16), TTS cutoff on BCM GPIO16 (physical pin 36), and RGB status LED channels: red on BCM GPIO27 (physical pin 13), green on BCM GPIO25 (physical pin 22), and blue on BCM GPIO17 (physical pin 11). Connect each normally-open button between its GPIO and ground; use physical pin 20 or 14 for ground. For the tested common-cathode RGB module with onboard resistors, connect `-` to ground, `R` to GPIO27, `G` to GPIO25, and `B` to GPIO17. Do not connect 5 V to a GPIO pin. Run `pinout` on the Pi if unsure about header numbering. Set `ORION_TTS_INTERRUPT_PIN`, `ORION_STATUS_LED_RED_PIN`, `ORION_STATUS_LED_PIN`, or `ORION_STATUS_LED_BLUE_PIN` to change these assignments.
+Default controls are persistent microphone mute/unmute on BCM GPIO23 (physical pin 16), TTS cutoff on BCM GPIO16 (physical pin 36), and RGB status LED channels: red on BCM GPIO27 (physical pin 13), green on BCM GPIO25 (physical pin 22), and blue on BCM GPIO17 (physical pin 11). Explicit `ORION_VOICE_PROFILE=legacy` selects push-to-talk on GPIO23. Connect each normally-open button between its GPIO and ground; use physical pin 20 or 14 for ground. For the tested common-cathode RGB module with onboard resistors, connect `-` to ground, `R` to GPIO27, `G` to GPIO25, and `B` to GPIO17. Do not connect 5 V to a GPIO pin. Run `pinout` on the Pi if unsure about header numbering. Set `ORION_TTS_INTERRUPT_PIN`, `ORION_STATUS_LED_RED_PIN`, `ORION_STATUS_LED_PIN`, or `ORION_STATUS_LED_BLUE_PIN` to change these assignments. LED states: green means listening, blue means processing, cyan means speaking, amber means muted, and red means error. Mute color overrides other states.
 
 Run checks separately before enabling the systemd service. Do not launch `orion --run-voice` or `orion --run-reminders` manually while `orion.service` is active; both modes use the same reminder database, and only one scheduler may own it:
 
@@ -144,7 +166,7 @@ orion --request 'What time is it?'
 orion --voice-check
 ```
 
-`orion --voice-check` should log a short transcript and speak “Local voice pipeline is ready.” Press GPIO23, wait for VOSK initialization to finish, then speak clearly and pause. If “Microphone chunk queue overflowed” occurs, verify the small VOSK model and `ORION_AUDIO_QUEUE_CHUNKS=100` are active in that shell. If the log loads `vosk-model-en-us-0.22-lgraph`, the model override was not applied. `orion --run-voice` also needs a running local model backend; otherwise reasoning turns retry and fail with `FileNotFoundError` when no GGUF is configured for managed llama.cpp.
+`orion --voice-check` should log a short transcript and speak “Local voice pipeline is ready.” In the candidate wakeword profile, say “Hey Orion” and then speak clearly; GPIO23 mutes or unmutes the microphone. The default legacy profile uses GPIO23 for push-to-talk and VOSK. Run `orion --validate-wakeword-assets` before starting the candidate service. `orion --run-voice` also needs a running local model backend; otherwise reasoning turns retry and fail with `FileNotFoundError` when no GGUF is configured for managed llama.cpp.
 
 The target is Debian 13 (trixie), kernel `6.18.50+rpt-pi-2712`, aarch64, Python 3.12.15 for voice, uv 0.12.22, and Ollama 0.35.0. The Ollama model is `qwen3:1.7b`, digest `8f68893c685c`; Python dependency versions are pinned in `uv.lock`. On the Pi, the locked profile passes `uv pip check` (98 packages), and the installed dedicated runtime passes 140 tests and 34 subtests. The owned-stream TTS fix passed 12 interruption stress cycles; the deployed schema-placeholder guard and 128-token output cap are active. The user confirmed multi-turn voice interaction works through systemd. Earlier native-abort, timeout, and placeholder failures are historical evidence, not current observed behavior. Reboot, reminder catch-up/retry/recurrence under systemd, sustained-session performance, and clean-image installation remain open.
 
@@ -170,7 +192,7 @@ sudo install -o root -g root -m 0755 /home/orion/.local/bin/uv /usr/local/bin/uv
 
 sudo env UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-bootstrap /usr/local/bin/uv python install 3.12
 sudo install -d -o orion-service -g orion-service -m 0750 /opt/orion/.venv-voice
-sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-install-project --extra voice --extra pi --extra test --python 3.12 --project /opt/orion
+sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-install-project --extra voice --extra wakeword --extra pi --extra test --python 3.12 --project /opt/orion
 sudo -u orion-service mkdir -p /var/cache/orion/build/src /var/cache/orion/wheels
 sudo -u orion-service rsync -a --chown=orion-service:orion-service --chmod=D750,F640 /opt/orion/src/ /var/cache/orion/build/src/
 sudo -u orion-service install -m 0640 /opt/orion/pyproject.toml /var/cache/orion/build/pyproject.toml
@@ -204,7 +226,7 @@ Do not overwrite an existing `/var/lib/orion/orion.sqlite3`; take and verify a b
 sudo systemctl enable --now orion.service
 ```
 
-The environment file is root-owned and group-readable by `orion-service`; it contains no credentials. It selects the small VOSK model, Jabra device, Ollama loopback endpoint, disabled wake-word mode, offline Hugging Face cache, uv cache/Python directories, and the systemd-owned database. If the wired pins or exact device name differ, edit the file before installation. Unit paths are intentionally explicit.
+The environment file is root-owned and group-readable by `orion-service`; it contains no credentials. The source example selects legacy/VOSK, ALSA `default`, Ollama loopback, offline Hugging Face cache, uv cache/Python directories, and the systemd-owned database. Keep this known-good fallback until all local wake assets pass manifest and ONNX compatibility validation. If the wired pins or device routing differ, edit the file before installation. Unit paths are intentionally explicit.
 
 Inspect and control the service with:
 
@@ -218,17 +240,17 @@ sudo systemctl disable orion.service
 
 The unit restarts on unexpected process failure, not on a clean stop. It allows up to 150 seconds for orderly shutdown because an in-flight bounded model request may use the 120-second task limit. `SIGTERM` asks the service to stop and requests TTS interruption. If stop reaches the timeout, inspect the journal before using `systemctl kill`; do not launch a second voice process until the old process has exited.
 
-For an upgrade, first stop the service, back up `/var/lib/orion/orion.sqlite3` using the online backup API above, then stage the new source into `/opt/orion` with the same rsync excludes/ownership and run `sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-editable --extra voice --extra pi --extra test --python 3.12 --project /opt/orion`. Then reload and restart the service. Verify `systemctl status`, the journal, local database access, and one voice/reminder check before considering the upgrade complete. For rollback, stop the service, restore the previous source revision and its matching locked environment, restore the pre-upgrade database backup if schema/data changed, then start and inspect the service. Keep backups outside `/var/lib/orion` and restrict them to the `orion-service` account.
+For an upgrade, first stop the service, back up `/var/lib/orion/orion.sqlite3` using the online backup API above, then stage the new source into `/opt/orion` with the same rsync excludes/ownership and run `sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-editable --extra voice --extra wakeword --extra pi --extra test --python 3.12 --project /opt/orion`. Then reload and restart the service. Verify `systemctl status`, the journal, local database access, and one voice/reminder check before considering the upgrade complete. For rollback, stop the service, restore the previous source revision and its matching locked environment, restore the pre-upgrade database backup if schema/data changed, then start and inspect the service. Keep backups outside `/var/lib/orion` and restrict them to the `orion-service` account.
 
 Troubleshooting:
 
 - `Permission denied` for GPIO/audio: check `id orion-service`, device ownership, and the `audio`/`gpio` groups, then restart the service after group changes. Do not solve this by running ORION as root.
-- Missing audio device: run `/opt/orion/.venv-voice/bin/python -m sounddevice` as `orion-service`, check the exact `ORION_AUDIO_DEVICE` in `/etc/orion/orion.env`, and confirm the USB headset is connected before restart.
+- Audio device or sample-rate error: run `/opt/orion/.venv-voice/bin/python -m sounddevice` as `orion-service`, check `ORION_AUDIO_DEVICE` in `/etc/orion/orion.env`, then run input/output `check_*_settings` at ORION's configured rates. On the tested Pi, ALSA `default` accepts 16 kHz input and 24 kHz output; direct AIRHUG requires 48 kHz.
 - `Another reminder scheduler already owns this database`: keep the systemd voice service as the sole owner; stop it before any manual `--run-reminders` maintenance process.
 - TTS model unavailable with `HF_HUB_OFFLINE=1`: run the one-time online KittenTTS synthesis as `orion-service` using `HF_HOME=/var/cache/orion/huggingface`, then restore offline mode and restart the service.
 - Local reasoning unavailable: check `systemctl status ollama`, `ollama list`, and `curl http://127.0.0.1:11434/api/tags`. Keep Ollama bound to loopback.
 
-No microphone or speaker mute control is installed because no mute hardware/wiring is configured. Audio capture remains gated during TTS; the separate GPIO16 cutoff button interrupts playback. Wake-word mode remains disabled by default. `main.py`, `main_llama.py`, and `stt_lib.py` are historical upstream files, not supported launch commands.
+The live Pi and source default remain on legacy/VOSK until the complete Phase 13 asset set is verified. The wakeword candidate uses GPIO23 for persistent microphone mute and GPIO16 to interrupt playback. `main.py`, `main_llama.py`, and `stt_lib.py` are historical upstream files, not supported launch commands.
 
 ### Phase 11 measurement capture
 
@@ -239,3 +261,31 @@ sudo /opt/orion/scripts/phase11-capture.sh 300 1 /var/lib/orion/phase11 "idle-li
 ```
 
 The arguments are capture duration in seconds, sampling interval in seconds, output root, and workload label. During separate captures, exercise idle listening, repeated STT, several reasoning turns, TTS output, and reminder delivery. Run separate captures for cold model start and warm requests. A preliminary 30-second idle capture measured ORION RSS 488 MB, at least 7.69 GB available RAM, no swap, 46.1-48.3 C, and no throttling. A 120-second interactive capture across a time request and two reasoning turns measured peak ORION RSS 499 MB, Ollama RSS 2.39 GB, at least 5.29 GB available RAM, no swap, and 58.7 C maximum; planner calls took 10.9/8.1 seconds, STT 2.49/2.85 seconds, and TTS 6.11/14.74 seconds. The PTT wait was separately recorded and included user think time. These short captures are not cold-start peak or sustained results. For a sustained run, use at least 30 minutes and record power supply, cooling, and ambient temperature manually; software cannot reliably identify those physical conditions. Review `resources.csv`/`summary.txt` for RSS, CPU, memory headroom, swap, temperature, and throttling; CPU percentages are interval deltas summed across cores and can exceed 100%. Review `orion-journal.log` for stage timings and errors. The script records no microphone data or transcript content. Do not compare models unless prompt, context, quantization, runtime, and thermal conditions are held constant.
+
+### Windows shortcuts
+
+Run local tests and CLI smoke checks:
+
+```powershell
+.\scripts\test-local.ps1
+```
+
+The local shortcut invokes ORION with `python -m orion`; this avoids Windows Application Control blocking the generated `orion.exe` launcher.
+
+Deploy the current worktree to the Pi. The script packages source while excluding virtual environments, models, secrets, and databases. It uploads a staging archive, stops the service, tests staged code, backs up `/opt/orion` source and the configured SQLite database via the online backup API, syncs the locked voice/Pi/test environment, tests deployed code, then starts and verifies the service. On failure, it restores source and restarts the previous service; the database backup remains for manual recovery.
+
+```powershell
+.\scripts\deploy-pi.ps1
+.\scripts\deploy-pi.ps1 -Target orion@192.168.1.50
+# Override if ORION_DATABASE_PATH differs from /var/lib/orion/orion.sqlite3:
+.\scripts\deploy-pi.ps1 -DatabasePath /custom/path/orion.sqlite3
+```
+
+Restart the Pi service without deploying:
+
+```powershell
+.\scripts\restart-pi.ps1
+.\scripts\restart-pi.ps1 -Target orion@192.168.1.50
+```
+
+The Pi scripts require OpenSSH Client and an SSH account authorized to run the required `sudo` commands. SSH and sudo prompts are interactive; sudo may prompt again for separate remote commands. Type credentials directly into the terminal. Scripts do not store passwords. Deployment retains source and SQLite backups under `/var/backups/orion`; it does not alter `/etc/orion/orion.env`, provision models, or migrate the database during file sync. The restarted application may perform its normal additive schema initialization. Rollback restores source/environment, not the database; keep the protected SQLite backup for manual recovery. Verify AIRHUG 01's PortAudio selector and test physical audio after deployment.

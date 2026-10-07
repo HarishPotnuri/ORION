@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -13,9 +14,12 @@ from threading import Event
 from .config import Settings
 from .logging_config import configure_logging
 from .audio.capture import AudioGate
+from .audio.control import MicrophoneControl
+from .audio.factory import create_speech_output, create_transcriber
+from .audio.listener import WakeListenerInput
 from .audio.stt import PushToTalkInput, WakeWordInput
 from .audio.tts import KittenSpeechOutput
-from .audio.wakeword import OpenWakeWordDetector
+from .audio.wakeword import OpenWakeWordDetector, validate_settings as validate_wakeword_settings
 from .core.router import OrionRouter
 from .core.orchestrator import RequestOrchestrator
 from .memory.manager import MemoryManager
@@ -42,9 +46,34 @@ class _StatusSpeechOutput:
             self.set_status("IDLE")
 
 
+class _VoiceStatusLED:
+    def __init__(self):
+        self.led = None
+        self._status = "IDLE"
+        self._muted = False
+
+    def attach(self, led) -> None:
+        self.led = led
+        self._render()
+
+    def set_status(self, status: str) -> None:
+        self._status = status
+        self._render()
+
+    def set_muted(self, muted: bool) -> None:
+        self._muted = muted
+        self._render()
+
+    def _render(self) -> None:
+        if self.led is not None:
+            _set_led_status(self.led, "MUTED" if self._muted else self._status)
+
+
 def _confirm_spoken_action(prompt: str, audio_input, speech_output) -> bool:
     speech_output.speak(prompt)
     answer = audio_input.next_utterance(timeout=15.0).strip().casefold().strip(" .!?\t")
+    if hasattr(audio_input, "claim_utterance") and not audio_input.claim_utterance():
+        return False
     return answer in {"yes", "yes confirm", "confirm", "do it"}
 
 
@@ -66,6 +95,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--check-config",
         action="store_true",
         help="validate settings and exit",
+    )
+    parser.add_argument(
+        "--validate-wakeword-assets",
+        action="store_true",
+        help="validate local wake-word ONNX files and manifest, then exit",
     )
     parser.add_argument(
         "--voice-check",
@@ -101,8 +135,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     configure_logging(settings)
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
     if args.check_config:
         logger.info("Configuration is valid; runtime adapters are not initialized")
+    elif args.validate_wakeword_assets:
+        try:
+            validate_wakeword_settings(settings)
+        except (OSError, RuntimeError, ValueError) as error:
+            logger.error("Wake-word asset validation failed: %s", error)
+            return 1
+        logger.info("Wake-word ONNX assets, hashes, metadata, and runtime compatibility are valid")
     elif args.route is not None:
         decision = OrionRouter().route(args.route)
         action = f" {decision.action}" if decision.action else ""
@@ -136,20 +179,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _create_audio_input(settings: Settings, gate: AudioGate, stop_event: Event):
+def _create_audio_input(
+    settings: Settings, gate: AudioGate, stop_event: Event, set_status=None,
+    set_microphone_muted=None,
+):
     try:
         from gpiozero import Button
     except ImportError as error:
         raise RuntimeError("gpiozero is required for voice input") from error
 
-    if settings.wake_word_enabled:
-        detector = OpenWakeWordDetector(
-            settings.wake_word, settings.wake_word_threshold
+    if settings.voice_profile == "wakeword" or settings.wake_word_enabled:
+        detector = OpenWakeWordDetector.from_settings(settings)
+        control = MicrophoneControl(settings.database_path.expanduser())
+        transcriber = None
+        audio_input = None
+        button = None
+        try:
+            transcriber = create_transcriber(settings)
+            audio_input = WakeListenerInput(
+                settings, detector, transcriber, control, gate=gate,
+                stop_event=stop_event,
+                on_wake=(lambda: set_status("LISTENING")) if set_status is not None else None,
+            )
+            button = Button(
+                settings.microphone_control_pin, bounce_time=settings.microphone_button_debounce
+            )
+
+            def toggle_microphone():
+                muted = control.toggle()
+                if set_microphone_muted is not None:
+                    set_microphone_muted(muted)
+                elif set_status is not None:
+                    set_status("MUTED" if muted else "IDLE")
+                logger.info("Microphone state=%s", "muted" if muted else "unmuted")
+
+            button.when_pressed = toggle_microphone
+            audio_input.start()
+            if set_microphone_muted is not None:
+                set_microphone_muted(control.muted)
+            if set_status is not None:
+                set_status("IDLE")
+        except Exception:
+            if button is not None:
+                try:
+                    button.close()
+                except Exception as error:
+                    logger.warning("Could not clean up microphone button (%s)", type(error).__name__)
+            if audio_input is not None:
+                try:
+                    audio_input.close()
+                except Exception as error:
+                    logger.warning("Could not clean up wake listener (%s)", type(error).__name__)
+            else:
+                if transcriber is not None:
+                    close_transcriber = getattr(transcriber, "close", None)
+                    if close_transcriber is not None:
+                        try:
+                            close_transcriber()
+                        except Exception as error:
+                            logger.warning("Could not clean up STT adapter (%s)", type(error).__name__)
+                control.close()
+            raise
+        logger.info(
+            "Waiting for wake word '%s'; GPIO %d toggles microphone mute",
+            settings.wake_word,
+            settings.microphone_control_pin,
         )
-        audio_input = WakeWordInput(settings, detector, gate=gate, stop_event=stop_event)
-        audio_input.warmup()
-        logger.info("Waiting for wake word '%s'", settings.wake_word)
-        return audio_input, None
+        return audio_input, button
     button = Button(settings.push_to_talk_pin)
     audio_input = PushToTalkInput(settings, button, gate=gate, stop_event=stop_event)
     try:
@@ -169,7 +265,11 @@ def _create_interrupt_button(settings: Settings, gate: AudioGate, push_to_talk_b
 
     interrupt_button = Button(settings.tts_interrupt_pin)
     interrupt_button.when_pressed = gate.request_interrupt
-    if push_to_talk_button is not None:
+    if (
+        push_to_talk_button is not None
+        and settings.voice_profile == "legacy"
+        and not settings.wake_word_enabled
+    ):
         push_to_talk_button.when_pressed = gate.request_interrupt
     return interrupt_button
 
@@ -177,8 +277,9 @@ def _create_interrupt_button(settings: Settings, gate: AudioGate, push_to_talk_b
 def _run_voice_check(settings: Settings) -> None:
     gate = AudioGate()
     stop_event = Event()
-    speech_output = KittenSpeechOutput(settings, gate)
-    speech_output.warmup()
+    speech_output = create_speech_output(settings, gate)
+    if settings.voice_profile == "legacy":
+        speech_output.warmup()
     audio_input, button = _create_audio_input(settings, gate, stop_event)
     try:
         transcript = audio_input.next_utterance()
@@ -189,6 +290,9 @@ def _run_voice_check(settings: Settings) -> None:
         speech_output.speak("Local voice pipeline is ready.")
     finally:
         stop_event.set()
+        close_input = getattr(audio_input, "close", None)
+        if close_input is not None:
+            close_input()
         if button is not None:
             button.close()
 
@@ -203,7 +307,11 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
             stage_name = "input"
             stage_started = time.monotonic()
             try:
-                set_status("LISTENING")
+                set_status(
+                    "IDLE"
+                    if isinstance(audio_input, (WakeListenerInput, WakeWordInput))
+                    else "LISTENING"
+                )
                 transcript = audio_input.next_utterance()
                 logger.info(
                     "Voice stage=input_total turn=%d elapsed_ms=%.1f outcome=%s",
@@ -214,13 +322,19 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                 if stop_event.is_set():
                     break
                 if not transcript.strip():
+                    if isinstance(audio_input, WakeListenerInput):
+                        continue
                     speech_output.speak("I didn't catch that. Please try again.")
+                    continue
+                if hasattr(audio_input, "claim_utterance") and not audio_input.claim_utterance():
                     continue
                 logger.info("Transcript received (%d characters)", len(transcript))
                 set_status("PROCESSING")
                 stage_name = "orchestration"
                 stage_started = time.monotonic()
                 result = orchestrator.handle(transcript)
+                if stop_event.is_set():
+                    break
                 logger.info(
                     "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=%s completed=%s",
                     turn_number,
@@ -277,12 +391,12 @@ def _run_voice_service(settings: Settings) -> None:
     old_sigterm = signal.getsignal(signal.SIGTERM)
     gate = AudioGate()
     led = None
+    voice_status = _VoiceStatusLED()
     audio_input = button = interrupt_button = None
     model = memory = reminders = scheduler = speech_output = None
 
     def set_status(status: str) -> None:
-        if led is not None:
-            _set_led_status(led, status)
+        voice_status.set_status(status)
 
     def speak(text: str) -> None:
         speech_output.speak(text)
@@ -293,13 +407,15 @@ def _run_voice_service(settings: Settings) -> None:
             green=settings.status_led_pin,
             blue=settings.status_led_blue_pin,
         )
+        voice_status.attach(led)
         model = _LazyLocalModel(settings)
         memory = MemoryManager.from_settings(settings)
         reminders = ReminderManager.from_settings(settings)
         speech_output = _StatusSpeechOutput(
-            KittenSpeechOutput(settings, gate), set_status
+            create_speech_output(settings, gate), set_status
         )
-        speech_output.warmup()
+        if settings.voice_profile == "legacy":
+            speech_output.warmup()
         scheduler = ReminderScheduler(
             reminders.store,
             ReminderNotifier(speak, set_status),
@@ -312,7 +428,12 @@ def _run_voice_service(settings: Settings) -> None:
 
         signal.signal(signal.SIGINT, stop_service)
         signal.signal(signal.SIGTERM, stop_service)
-        audio_input, button = _create_audio_input(settings, gate, stop_event)
+        if settings.voice_profile == "wakeword" or settings.wake_word_enabled:
+            audio_input, button = _create_audio_input(
+                settings, gate, stop_event, set_status, voice_status.set_muted
+            )
+        else:
+            audio_input, button = _create_audio_input(settings, gate, stop_event)
 
         interrupt_button = _create_interrupt_button(settings, gate, button)
 
@@ -335,6 +456,7 @@ def _run_voice_service(settings: Settings) -> None:
         if audio_input is not None:
             audio_input.stop_event.set()
         cleanup_actions = (
+            ("audio input", getattr(audio_input, "close", None)),
             ("scheduler", scheduler.stop if scheduler is not None else None),
             ("model", model.close if model is not None else None),
             ("memory", memory.close if memory is not None else None),
@@ -367,7 +489,7 @@ def _run_reminder_service(settings: Settings) -> None:
 
     led = PWMLED(settings.status_led_pin)
     manager = ReminderManager.from_settings(settings)
-    speech_output = KittenSpeechOutput(settings, AudioGate())
+    speech_output = create_speech_output(settings, AudioGate())
 
     def set_status(status: str) -> None:
         if status == "SPEAKING":

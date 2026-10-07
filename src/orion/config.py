@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -54,7 +56,23 @@ class Settings:
     reminder_poll_interval: float = 5.0
     searxng_base_url: str = ""
     searxng_allowed_hosts: tuple[str, ...] = ()
-    audio_device: str | None = None
+    online_tools_enabled: bool = False
+    voice_profile: str = "legacy"
+    stt_backend: str = "vosk"
+    stt_language: str = "en"
+    stt_threads: int = 2
+    stt_timeout: float = 30.0
+    whisper_cli_path: str = "whisper-cli"
+    tts_backend: str = "kittentts"
+    wake_word_model_path: Path | None = None
+    wake_word_melspectrogram_path: Path | None = None
+    wake_word_embedding_path: Path | None = None
+    wake_word_manifest_path: Path | None = None
+    wake_word_threads: int = 1
+    wake_word_cooldown_seconds: float = 3.0
+    microphone_button_debounce: float = 0.01
+    tts_model_path: Path | None = None
+    audio_device: str | None = "default"
     audio_sample_rate: int = 16000
     audio_block_frames: int = 320
     audio_queue_chunks: int = 8
@@ -80,8 +98,15 @@ class Settings:
     @classmethod
     def from_environment(cls) -> Settings:
         model_backend = os.getenv("ORION_MODEL_BACKEND", "llama.cpp").lower()
+        voice_profile = os.getenv("ORION_VOICE_PROFILE", "legacy").lower()
+        default_stt_backend = "whisper.cpp" if voice_profile == "wakeword" else "vosk"
+        stt_backend = os.getenv("ORION_STT_BACKEND", default_stt_backend).lower()
+        wake_word_enabled = os.getenv("ORION_WAKE_WORD_ENABLED", "false").lower() in {
+            "1", "true", "yes", "on"
+        }
+        wakeword_profile = voice_profile == "wakeword" or wake_word_enabled
         model_path = os.getenv("ORION_MODEL_PATH")
-        audio_device = os.getenv("ORION_AUDIO_DEVICE")
+        audio_device = os.getenv("ORION_AUDIO_DEVICE", "default")
         microphone_mute_pin = os.getenv("ORION_MICROPHONE_MUTE_PIN")
         speaker_mute_pin = os.getenv("ORION_SPEAKER_MUTE_PIN")
 
@@ -120,6 +145,45 @@ class Settings:
                 if host.strip()
             ),
             audio_device=audio_device,
+            online_tools_enabled=os.getenv("ORION_ONLINE_TOOLS_ENABLED", "false").lower()
+            in {"1", "true", "yes", "on"},
+            voice_profile=voice_profile,
+            stt_backend=stt_backend,
+            stt_language=os.getenv("ORION_STT_LANGUAGE", "en").lower(),
+            stt_threads=_env_int("STT_THREADS", 2),
+            stt_timeout=_env_float("STT_TIMEOUT", 30.0),
+            whisper_cli_path=os.getenv("ORION_WHISPER_CLI_PATH", "whisper-cli"),
+            tts_backend=os.getenv("ORION_TTS_BACKEND", "kittentts").lower(),
+            tts_model_path=(
+                _env_path("TTS_MODEL_PATH", "")
+                if os.getenv("ORION_TTS_MODEL_PATH") else None
+            ),
+            wake_word_model_path=(
+                _env_path("WAKE_WORD_MODEL_PATH", "")
+                if os.getenv("ORION_WAKE_WORD_MODEL_PATH")
+                else Path("models/hey_jarvis.onnx")
+                if wakeword_profile else None
+            ),
+            wake_word_melspectrogram_path=(
+                _env_path("WAKE_WORD_MELSPECTROGRAM_PATH", "")
+                if os.getenv("ORION_WAKE_WORD_MELSPECTROGRAM_PATH")
+                else Path("artifacts/wakeword-staging/melspectrogram.onnx")
+                if wakeword_profile else None
+            ),
+            wake_word_embedding_path=(
+                _env_path("WAKE_WORD_EMBEDDING_PATH", "")
+                if os.getenv("ORION_WAKE_WORD_EMBEDDING_PATH")
+                else Path("artifacts/wakeword-staging/embedding_model.onnx")
+                if wakeword_profile else None
+            ),
+            wake_word_manifest_path=(
+                _env_path("WAKE_WORD_MANIFEST_PATH", "")
+                if os.getenv("ORION_WAKE_WORD_MANIFEST_PATH")
+                else None
+            ),
+            wake_word_threads=_env_int("WAKE_WORD_THREADS", 1),
+            wake_word_cooldown_seconds=_env_float("WAKE_WORD_COOLDOWN_SECONDS", 3.0),
+            microphone_button_debounce=_env_float("MICROPHONE_BUTTON_DEBOUNCE", 0.01),
             audio_sample_rate=_env_int("AUDIO_SAMPLE_RATE", 16000),
             audio_block_frames=_env_int("AUDIO_BLOCK_FRAMES", 320),
             audio_queue_chunks=_env_int("AUDIO_QUEUE_CHUNKS", 8),
@@ -128,11 +192,13 @@ class Settings:
             vad_silence_ms=_env_int("VAD_SILENCE_MS", 800),
             vad_preroll_ms=_env_int("VAD_PREROLL_MS", 200),
             wake_word=os.getenv("ORION_WAKE_WORD", "hey_jarvis"),
-            wake_word_enabled=os.getenv("ORION_WAKE_WORD_ENABLED", "false").lower()
-            in {"1", "true", "yes", "on"},
+            wake_word_enabled=wake_word_enabled,
             wake_word_threshold=_env_float("WAKE_WORD_THRESHOLD", 0.5),
             stt_model_path=_env_path(
-                "STT_MODEL_PATH", "models/vosk-model-en-us-0.22-lgraph"
+                "STT_MODEL_PATH",
+                "/opt/orion/models/whisper/ggml-base.en.bin"
+                if stt_backend == "whisper.cpp"
+                else "models/vosk-model-en-us-0.22-lgraph",
             ),
             tts_voice=os.getenv("ORION_TTS_VOICE", "expr-voice-3-f"),
             tts_sample_rate=_env_int("TTS_SAMPLE_RATE", 24000),
@@ -151,6 +217,36 @@ class Settings:
         return settings
 
     def validate(self) -> None:
+        if self.voice_profile not in {"legacy", "wakeword"}:
+            raise ValueError("ORION_VOICE_PROFILE must be 'legacy' or 'wakeword'")
+        if self.stt_backend not in {"vosk", "whisper.cpp"}:
+            raise ValueError("ORION_STT_BACKEND must be 'vosk' or 'whisper.cpp'")
+        if self.tts_backend != "kittentts":
+            raise ValueError("ORION_TTS_BACKEND currently supports only 'kittentts'; Piper is Phase 15")
+        if self.voice_profile == "legacy" and self.stt_backend != "vosk":
+            raise ValueError("Whisper requires ORION_VOICE_PROFILE=wakeword")
+        if self.voice_profile == "wakeword" or self.wake_word_enabled:
+            if self.voice_profile == "wakeword" and self.audio_sample_rate != 16000:
+                raise ValueError("Wake-word input requires 16000 Hz mono audio")
+            if any(path is None for path in (
+                self.wake_word_model_path,
+                self.wake_word_melspectrogram_path,
+                self.wake_word_embedding_path,
+            )):
+                raise ValueError("Wake-word input requires a local classifier and feature ONNX paths")
+        if not re.fullmatch(r"(?:[a-z]{2,3}|auto)", self.stt_language):
+            raise ValueError("ORION_STT_LANGUAGE must be a language code or 'auto'")
+        if self.stt_threads < 1 or self.wake_word_threads < 1:
+            raise ValueError("ORION STT and wake-word threads must be positive")
+        if (
+            not math.isfinite(self.stt_timeout)
+            or not math.isfinite(self.microphone_button_debounce)
+            or not math.isfinite(self.wake_word_cooldown_seconds)
+            or self.stt_timeout <= 0
+            or self.microphone_button_debounce <= 0
+            or self.wake_word_cooldown_seconds < 0
+        ):
+            raise ValueError("ORION STT timeout and microphone debounce must be positive; wake cooldown cannot be negative")
         if self.model_backend not in {"llama.cpp", "ollama"}:
             raise ValueError("ORION_MODEL_BACKEND must be 'llama.cpp' or 'ollama'")
         if self.model_context_size < 512:
@@ -214,7 +310,7 @@ class Settings:
 
     def _validate_gpio_pins(self) -> None:
         configured_pins = [
-            self.push_to_talk_pin,
+            self.microphone_control_pin if self.voice_profile == "wakeword" else self.push_to_talk_pin,
             self.tts_interrupt_pin,
             self.status_led_red_pin,
             self.status_led_pin,
@@ -222,10 +318,17 @@ class Settings:
         ]
         configured_pins.extend(
             pin
-            for pin in (self.microphone_mute_pin, self.speaker_mute_pin)
+            for pin in (
+                self.microphone_mute_pin if self.voice_profile == "legacy" else None,
+                self.speaker_mute_pin,
+            )
             if pin is not None
         )
         if any(pin < 0 for pin in configured_pins):
             raise ValueError("ORION GPIO pin numbers must be non-negative")
         if len(configured_pins) != len(set(configured_pins)):
             raise ValueError("ORION GPIO pin numbers must be unique")
+
+    @property
+    def microphone_control_pin(self) -> int:
+        return self.microphone_mute_pin if self.microphone_mute_pin is not None else self.push_to_talk_pin

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import array
+import json
 import threading
 import queue
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from ..config import Settings
@@ -23,6 +25,7 @@ class KittenSpeechOutput:
         gate: AudioGate,
         *,
         tts_factory: Callable | None = None,
+        local_tts_factory: Callable | None = None,
         play: Callable | None = None,
         wait: Callable | None = None,
         stop: Callable | None = None,
@@ -31,6 +34,7 @@ class KittenSpeechOutput:
         self.settings = settings
         self.gate = gate
         self._tts_factory = tts_factory
+        self._local_tts_factory = local_tts_factory
         self._play = play
         self._wait = wait
         self._stop = stop
@@ -59,6 +63,11 @@ class KittenSpeechOutput:
 
     def _load_engine(self):
         if self._engine is None:
+            if self.settings.tts_model_path is not None:
+                self._engine = self._load_local_engine(
+                    self.settings.tts_model_path.expanduser()
+                )
+                return self._engine
             factory = self._tts_factory
             if factory is None:
                 try:
@@ -68,6 +77,41 @@ class KittenSpeechOutput:
                 factory = KittenTTS
             self._engine = factory("KittenML/kitten-tts-nano-0.2")
         return self._engine
+
+    def _load_local_engine(self, model_directory: Path):
+        root = model_directory.resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Local KittenTTS model directory not found: {root}")
+        try:
+            with (root / "config.json").open(encoding="utf-8") as config_file:
+                config = json.load(config_file)
+        except (OSError, json.JSONDecodeError):
+            raise ValueError("Local KittenTTS directory has an invalid config.json") from None
+        if not isinstance(config, dict) or config.get("type") != "ONNX1":
+            raise ValueError("Local KittenTTS config must describe an ONNX1 model")
+
+        paths = []
+        for field in ("model_file", "voices"):
+            relative_path = config.get(field)
+            if not isinstance(relative_path, str) or not relative_path:
+                raise ValueError(f"Local KittenTTS config is missing {field}")
+            asset_path = (root / relative_path).resolve()
+            try:
+                asset_path.relative_to(root)
+            except ValueError:
+                raise ValueError("Local KittenTTS assets must stay inside the model directory") from None
+            if not asset_path.is_file():
+                raise FileNotFoundError(f"Local KittenTTS asset not found: {asset_path.name}")
+            paths.append(str(asset_path))
+
+        factory = self._local_tts_factory
+        if factory is None:
+            try:
+                from kittentts.onnx_model import KittenTTS_1_Onnx
+            except ImportError as error:
+                raise RuntimeError("kittentts is required for local speech output") from error
+            factory = KittenTTS_1_Onnx
+        return factory(model_path=paths[0], voices_path=paths[1])
 
     def warmup(self) -> None:
         started = time.perf_counter()

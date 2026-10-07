@@ -1,4 +1,5 @@
 import array
+import json
 import threading
 import tempfile
 import sys
@@ -196,6 +197,44 @@ class AudioTests(unittest.TestCase):
 
         self.assertTrue(detector.detected(pcm(0, 10)))
 
+    def test_wakeword_detection_is_debounced_and_respects_cooldown(self):
+        now = [10.0]
+
+        class FakeWakeModel:
+            score = 0.8
+
+            def __init__(self, **_kwargs):
+                pass
+
+            def predict(self, _samples):
+                return {"hey_jarvis": self.score}
+
+        model = FakeWakeModel()
+        detector = OpenWakeWordDetector(
+            "hey_jarvis", 0.5, model_factory=lambda **_kwargs: model,
+            samples_factory=lambda chunk: chunk, cooldown_seconds=2.0,
+            clock=lambda: now[0],
+        )
+
+        assert detector.detected(pcm(0, 10))
+        assert not detector.detected(pcm(0, 10))
+        model.score = 0.1
+        assert not detector.detected(pcm(0, 10))
+        model.score = 0.8
+        now[0] = 11.9
+        assert not detector.detected(pcm(0, 10))
+        model.score = 0.1
+        assert not detector.detected(pcm(0, 10))
+        model.score = 0.8
+        now[0] = 12.0
+        assert detector.detected(pcm(0, 10))
+
+    def test_wakeword_rejects_invalid_threshold_and_cooldown(self):
+        with self.assertRaisesRegex(ValueError, "threshold must be between 0 and 1"):
+            OpenWakeWordDetector("hey_jarvis", 1.1, model_factory=lambda **_kwargs: None)
+        with self.assertRaisesRegex(ValueError, "cooldown cannot be negative"):
+            OpenWakeWordDetector("hey_jarvis", 0.5, model_factory=lambda **_kwargs: None, cooldown_seconds=-1)
+
     def test_tts_uses_memory_and_reopens_capture_gate_on_error(self):
         gate = AudioGate()
         played = []
@@ -208,8 +247,8 @@ class AudioTests(unittest.TestCase):
                 self.voice = voice
                 return [0.1, -0.1]
 
-        def fail_play(audio, *, samplerate):
-            played.append((list(audio), samplerate))
+        def fail_play(audio, *, samplerate, device=None):
+            played.append((list(audio), samplerate, device))
             raise RuntimeError("playback failed")
 
         speech = KittenSpeechOutput(
@@ -219,7 +258,7 @@ class AudioTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "playback failed"):
             speech.speak("test")
         gate.wait_until_open()
-        self.assertEqual(played, [([0.1, -0.1], 24000)])
+        self.assertEqual(played, [([0.1, -0.1], 24000, "default")])
 
     def test_tts_warmup_loads_engine_and_runs_discarded_synthesis(self):
         generated = []
@@ -248,6 +287,53 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(generated, ["initialized", ("Ready.", "test-voice"), ("A real response", "test-voice")])
         self.assertEqual(played, [[0.1, -0.1]])
+
+    def test_tts_loads_local_onnx_artifacts_without_hub_model_factory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_directory = Path(directory)
+            (model_directory / "config.json").write_text(
+                json.dumps({"type": "ONNX1", "model_file": "model.onnx", "voices": "voices.npz"}),
+                encoding="utf-8",
+            )
+            (model_directory / "model.onnx").touch()
+            (model_directory / "voices.npz").touch()
+            loaded = []
+
+            def local_factory(**kwargs):
+                loaded.append(kwargs)
+                return object()
+
+            speech = KittenSpeechOutput(
+                replace(self.small_settings(), tts_model_path=model_directory),
+                AudioGate(),
+                tts_factory=lambda _model_name: self.fail("Hub loader must not run"),
+                local_tts_factory=local_factory,
+            )
+
+            speech._load_engine()
+
+            self.assertEqual(loaded, [{
+                "model_path": str((model_directory / "model.onnx").resolve()),
+                "voices_path": str((model_directory / "voices.npz").resolve()),
+            }])
+
+    def test_tts_missing_local_asset_fails_without_hub_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_directory = Path(directory)
+            (model_directory / "config.json").write_text(
+                json.dumps({"type": "ONNX1", "model_file": "missing.onnx", "voices": "voices.npz"}),
+                encoding="utf-8",
+            )
+            (model_directory / "voices.npz").touch()
+            speech = KittenSpeechOutput(
+                replace(self.small_settings(), tts_model_path=model_directory),
+                AudioGate(),
+                tts_factory=lambda _model_name: self.fail("Hub loader must not run"),
+                local_tts_factory=lambda **_kwargs: self.fail("Local loader must not run"),
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "Local KittenTTS asset"):
+                speech._load_engine()
 
     def test_tts_resamples_when_output_device_rejects_generated_rate(self):
         gate = AudioGate()

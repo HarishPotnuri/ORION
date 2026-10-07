@@ -31,6 +31,7 @@ class AudioGate:
         self._ready.set()
         self._interrupt = threading.Event()
         self._lock = threading.Lock()
+        self._generation = 0
 
     def wait_until_open(self) -> None:
         self._ready.wait()
@@ -38,6 +39,11 @@ class AudioGate:
     @property
     def is_open(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def request_interrupt(self) -> None:
         with self._lock:
@@ -51,11 +57,13 @@ class AudioGate:
     def speaking(self):
         with self._lock:
             self._interrupt.clear()
+            self._generation += 1
             self._ready.clear()
         try:
             yield
         finally:
             with self._lock:
+                self._generation += 1
                 self._ready.set()
 
 
@@ -120,7 +128,7 @@ class SoundDeviceChunkSource:
                                 input_queue.get_nowait()
                             except queue.Empty:
                                 break
-                        self.gate.wait_until_open()
+                        stop_event.wait(0.1)
                         continue
                     try:
                         yield input_queue.get(timeout=0.1)

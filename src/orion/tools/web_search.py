@@ -33,6 +33,11 @@ class SearxngSearchTool:
         self.max_field_chars = max_field_chars
 
     def execute(self, arguments, *, timeout: float, cancel_event: threading.Event) -> ToolResult:
+        if not self.settings.online_tools_enabled:
+            return ToolResult(
+                "Web search is disabled in offline mode. Enable online tools to use it.",
+                success=False,
+            )
         if not self.settings.searxng_base_url:
             return ToolResult(
                 "Web search is not configured. Configure an HTTPS SearXNG instance and exact allowed host.",

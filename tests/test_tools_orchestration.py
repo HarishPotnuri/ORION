@@ -138,6 +138,26 @@ class LocalToolTests(unittest.TestCase):
 
 
 class FactualToolTests(unittest.TestCase):
+    def test_offline_tools_block_transport_even_when_search_is_configured(self):
+        settings = Settings(
+            searxng_base_url="https://search.example.test",
+            searxng_allowed_hosts=("search.example.test",),
+        )
+        for tool_class in (OpenMeteoWeatherTool, SearxngSearchTool):
+            with self.subTest(tool=tool_class.name):
+                transport = FakeFactualTransport([])
+                tool = tool_class(settings, transport=transport)
+
+                result = tool.execute(
+                    {"query": "weather in Pune", "location": "Pune"},
+                    timeout=3,
+                    cancel_event=threading.Event(),
+                )
+
+                self.assertFalse(result.success)
+                self.assertIn("disabled in offline mode", result.content)
+                self.assertEqual(transport.calls, [])
+
     def test_weather_geocodes_then_fetches_compact_data(self):
         transport = FakeFactualTransport(
             [
@@ -168,7 +188,7 @@ class FactualToolTests(unittest.TestCase):
                 },
             ]
         )
-        tool = OpenMeteoWeatherTool(Settings(), transport=transport)
+        tool = OpenMeteoWeatherTool(Settings(online_tools_enabled=True), transport=transport)
 
         result = tool.execute(
             {"query": "What's the weather tomorrow in Pune?"},
@@ -185,18 +205,19 @@ class FactualToolTests(unittest.TestCase):
 
     def test_weather_requires_location_without_network_access(self):
         transport = FakeFactualTransport([])
-        tool = OpenMeteoWeatherTool(Settings(), transport=transport)
+        tool = OpenMeteoWeatherTool(Settings(online_tools_enabled=True), transport=transport)
 
         result = tool.execute(
             {"query": "What's the weather?"}, timeout=3, cancel_event=threading.Event()
         )
 
         self.assertFalse(result.success)
+        self.assertIn("specify a city", result.content)
         self.assertEqual(transport.calls, [])
 
     def test_search_fails_closed_when_not_configured(self):
         transport = FakeFactualTransport([])
-        tool = SearxngSearchTool(Settings(), transport=transport)
+        tool = SearxngSearchTool(Settings(online_tools_enabled=True), transport=transport)
 
         result = tool.execute(
             {"query": "search for local weather"},
@@ -210,7 +231,7 @@ class FactualToolTests(unittest.TestCase):
 
     def test_search_compacts_results_and_limits_fields(self):
         settings = replace(
-            Settings(),
+            Settings(online_tools_enabled=True),
             searxng_base_url="https://search.example.test",
             searxng_allowed_hosts=("search.example.test",),
         )
@@ -262,6 +283,53 @@ class FactualToolTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_offline_direct_routes_block_registered_fake_tools_and_model(self):
+        for name, request in (
+            ("weather", "What's the weather in Pune?"),
+            ("web_search", "Search for current space news"),
+        ):
+            with self.subTest(tool=name):
+                tool = FakeTool(name, ToolResult("must not run"))
+                model = ScriptedModel('{"type":"final","response":"must not run"}')
+                orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([tool]))
+
+                result = orchestrator.handle(request)
+
+                self.assertEqual(result.route.kind.value, "ONLINE_FACTUAL_LOOKUP")
+                self.assertFalse(result.completed)
+                self.assertIn("disabled in offline mode", result.response)
+                self.assertEqual(tool.calls, [])
+                self.assertEqual(model.calls, [])
+
+    def test_offline_planner_blocks_fake_factual_tools_but_runs_local_step(self):
+        for name, phrase in (("weather", "weather in Pune"), ("web_search", "latest space news")):
+            with self.subTest(tool=name):
+                factual = FakeTool(name, ToolResult("must not run"))
+                time_tool = FakeTool("time", ToolResult("It is 1 PM."))
+                model = PlanningModel(
+                    json.dumps({"type": "tool", "name": name, "arguments": {"query": phrase}}),
+                    json.dumps({"type": "tool", "name": "time", "arguments": {"action": "time"}}),
+                    json.dumps({"type": "final", "response": "Lookup is disabled in offline mode. It is 1 PM."}),
+                )
+                orchestrator = RequestOrchestrator(
+                    Settings(), model, ToolRegistry([factual, time_tool])
+                )
+
+                result = orchestrator.handle(f"Check {phrase} and tell me the time")
+
+                self.assertEqual(result.route.action, "multi_step")
+                self.assertTrue(result.completed)
+                self.assertEqual(factual.calls, [])
+                self.assertEqual(len(time_tool.calls), 1)
+                self.assertIn("offline mode", result.response)
+                for messages, _, _ in model.calls:
+                    prompt = " ".join(message.content for message in messages)
+                    self.assertIn("Offline mode: weather and web search are disabled", prompt)
+                    self.assertIn("No online lookup has run", prompt)
+                    self.assertNotIn(f"{name}: arguments", prompt)
+                observation = " ".join(message.content for message in model.calls[1][0])
+                self.assertIn(f"Tool {name} failed", observation)
+
     def test_clear_conversation_preserves_saved_memory_and_reminders(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
@@ -315,7 +383,7 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_planner_can_combine_weather_and_reminder_tools(self):
         with tempfile.TemporaryDirectory() as directory:
-            settings = replace(Settings(), database_path=Path(directory) / "orion.sqlite3")
+            settings = replace(Settings(online_tools_enabled=True), database_path=Path(directory) / "orion.sqlite3")
             model = PlanningModel(
                 json.dumps({
                     "type": "tool",
@@ -503,7 +571,7 @@ class OrchestrationTests(unittest.TestCase):
             json.dumps({"type": "final", "response": "I could not look up that location."}),
         )
         weather = FakeTool("weather", ToolResult("should not be called"))
-        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([weather]))
+        orchestrator = RequestOrchestrator(Settings(online_tools_enabled=True), model, ToolRegistry([weather]))
 
         result = orchestrator.handle(
             "Check the weather in Pune and tell me today's date"
@@ -520,7 +588,7 @@ class OrchestrationTests(unittest.TestCase):
         )
         weather = FakeTool("weather", ToolResult('{"location":"Pune","temperature":28}'))
         orchestrator = RequestOrchestrator(
-            Settings(), model, ToolRegistry([weather])
+            Settings(online_tools_enabled=True), model, ToolRegistry([weather])
         )
 
         result = orchestrator.handle("What's the weather tomorrow in Pune?")
@@ -535,12 +603,14 @@ class OrchestrationTests(unittest.TestCase):
         model = ScriptedModel('{"type":"final","response":"guess"}')
         weather = FakeTool("weather", ToolResult("Weather lookup failed.", success=False))
         orchestrator = RequestOrchestrator(
-            Settings(), model, ToolRegistry([weather])
+            Settings(online_tools_enabled=True), model, ToolRegistry([weather])
         )
 
         result = orchestrator.handle("What's the weather tomorrow in Pune?")
 
         self.assertFalse(result.completed)
+        self.assertEqual(result.response, "Weather lookup failed.")
+        self.assertEqual(len(weather.calls), 1)
         self.assertEqual(model.calls, [])
 
     def test_capability_fallback_skips_factual_and_model_calls(self):

@@ -1,0 +1,61 @@
+{
+  "record_type": "feature-assets-only-not-runtime-manifest",
+  "runtime_target": {
+    "name": "openwakeword",
+    "version": "0.6.0",
+    "framework": "onnx"
+  },
+  "source_release": {
+    "repository": "https://github.com/dscripka/openWakeWord",
+    "release_tag": "v0.5.1",
+    "tag_commit": "1eec2158c5c54150ac5f4c15065adacb1003b1e7",
+    "discovered_by": "openWakeWord v0.6.0 FEATURE_MODELS and download_models implementation"
+  },
+  "license_assessment": {
+    "upstream_code": "Apache-2.0",
+    "feature_model_release_artifacts": "CC-BY-NC-SA-4.0, conservative interpretation of openWakeWord README statement that included pretrained models use this license",
+    "google_speech_embedding_source": "Apache-2.0, as attributed by openWakeWord model architecture documentation",
+    "release_specific_asset_license_statement": "No per-asset license or release checksum was found in the release metadata; review the upstream README and asset provenance before redistribution.",
+    "commercial_use": "Not granted under CC-BY-NC-SA-4.0"
+  },
+  "assets": {
+    "melspectrogram": {
+      "file": "artifacts/wakeword-staging/melspectrogram.onnx",
+      "upstream_filename": "melspectrogram.onnx",
+      "source": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx",
+      "revision": "1eec2158c5c54150ac5f4c15065adacb1003b1e7",
+      "bytes": 1087958,
+      "sha256_local_calculation": "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f",
+      "upstream_published_sha256": null,
+      "onnx_cpu_contract": {
+        "input": ["input", "tensor(float)", ["batch", "samples"]],
+        "raw_output": ["output", "tensor(float)", ["time", 1, "mel_frames", 32]],
+        "squeezed_first_batch_output": ["mel_frames", 32]
+      },
+      "validation": "onnx.checker, ONNX Runtime CPU session, ORION contract check, and zero-input inference passed locally"
+    },
+    "embedding": {
+      "file": "artifacts/wakeword-staging/embedding_model.onnx",
+      "upstream_filename": "embedding_model.onnx",
+      "source": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx",
+      "revision": "1eec2158c5c54150ac5f4c15065adacb1003b1e7",
+      "bytes": 1326578,
+      "sha256_local_calculation": "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f",
+      "upstream_published_sha256": null,
+      "onnx_cpu_contract": {
+        "input": ["input_1", "tensor(float)", ["batch", 76, 32, 1]],
+        "raw_output": ["conv2d_19", "tensor(float)", ["batch", 1, 1, 96]],
+        "squeezed_first_batch_output": [96]
+      },
+      "validation": "onnx.checker, ONNX Runtime CPU session, ORION contract check, and zero-input inference passed locally"
+    }
+  },
+  "incomplete": {
+    "wake_phrase": "Hey Orion",
+    "missing_asset": "hey_orion.onnx classifier trained on the exact phrase and on the feature graphs hashed above",
+    "production_manifest_created": false,
+    "production_compatibility_claim": false,
+    "acoustic_acceptance": false,
+    "pi_installation_or_profile_change": false
+  }
+}

@@ -164,6 +164,12 @@ class RequestOrchestrator:
             return self._result(decision, result.content, result.success)
 
         if decision.kind == RouteKind.ONLINE_FACTUAL_LOOKUP:
+            if not self.settings.online_tools_enabled:
+                return self._result(
+                    decision,
+                    "Weather and web search are disabled in offline mode. Enable online tools to use factual lookups.",
+                    False,
+                )
             capability = self.capabilities.assess(request)
             if not capability.supported:
                 return self._result(decision, capability.response, False)
@@ -221,6 +227,12 @@ class RequestOrchestrator:
             "Complete each requested step before reporting success.\nAuthorized tools:\n"
             + (tool_guidance or "none")
         )
+        if not self.settings.online_tools_enabled:
+            task_state += (
+                "\nOffline mode: weather and web search are disabled. No online lookup has run. "
+                "Explicitly report this limitation for requested factual lookups; do not guess current facts "
+                "or claim a lookup succeeded. Complete independently authorized local steps where possible."
+            )
         agent = AgentController(
             self.settings,
             self.model,
@@ -246,10 +258,11 @@ class RequestOrchestrator:
     def _authorized_agent_tools(self, request: str) -> tuple[str, ...]:
         normalized = " ".join(request.casefold().split())
         allowed: set[str] = set()
-        if re.search(r"\b(?:weather|forecast|temperature|rain|snow)\b", normalized):
-            allowed.add("weather")
-        if re.search(r"\b(?:search|look up|lookup|browse|current|latest|recent|news|headlines)\b", normalized):
-            allowed.add("web_search")
+        if self.settings.online_tools_enabled:
+            if re.search(r"\b(?:weather|forecast|temperature|rain|snow)\b", normalized):
+                allowed.add("weather")
+            if re.search(r"\b(?:search|look up|lookup|browse|current|latest|recent|news|headlines)\b", normalized):
+                allowed.add("web_search")
         if self.router._time_queries.search(normalized) or self.router._date_queries.search(normalized):
             allowed.add("time")
         if self.router._system_queries.search(normalized):

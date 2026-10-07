@@ -1,6 +1,6 @@
 # Outstanding Issues
 
-Last reviewed: 2026-10-02
+Last reviewed: 2026-10-06
 
 This document tracks known open issues and unverified acceptance gates. A passing unit test or a successful isolated component check is not evidence that the complete voice service is reliable on the Raspberry Pi. Do not mark an item resolved until its closure criteria are met and the result is recorded here and, where appropriate, in `Plan.md`.
 
@@ -8,7 +8,8 @@ This document tracks known open issues and unverified acceptance gates. A passin
 
 - Hardware: Raspberry Pi 5, 8 GB RAM, aarch64; Debian 13 (trixie), kernel `6.18.50+rpt-pi-2712`.
 - Voice runtime: uv 0.12.22, Python 3.12.15, VOSK small English model `0.15`, KittenTTS 0.1.0 with nano 0.2 assets.
-- Audio/control: Jabra EVOLVE 20 MS USB audio; GPIO23 push-to-talk; GPIO16 TTS cutoff; RGB status LED on GPIO27 red, GPIO25 green, and GPIO17 blue.
+- Historical audio/control baseline: Jabra EVOLVE 20 MS USB; GPIO23 push-to-talk; GPIO16 TTS cutoff; RGB status LED on GPIO27 red, GPIO25 green, and GPIO17 blue.
+- Audio device update (2026-10-06): PortAudio lists AIRHUG as `AIRHUG 01: USB Audio (hw:0,0)`, with 2 input/output channels and a 48 kHz default rate. Direct AIRHUG rejects 16 kHz mono input and 24 kHz mono output but accepts 48 kHz for both. Code defaults, systemd example, and README now select ALSA `default`, which accepts ORION's configured rates. The live `/etc/orion/orion.env` was set to `ORION_AUDIO_DEVICE="default"`; user reports voice interaction appears to work. Actual routing through AIRHUG, sustained capture/playback, and interruption/soak behavior remain to be recorded.
 - Reasoning: Ollama 0.35.0 on loopback with `qwen3:1.7b`, digest `8f68893c685c`.
 - Dependency profile: versions are recorded in `uv.lock`; scoped uv exclusion avoids installing Misaki 0.9.4's unused curated-transformer extra and its incompatible CUDA dependency tree.
 
@@ -78,7 +79,7 @@ A diagnostic direct Ollama request using the planner's task state and a 264-toke
 
 1. On a freshly imaged 64-bit supported Raspberry Pi OS installation, follow only the documented prerequisites and locked uv setup in `README.md`.
 2. Record image/version, apt prerequisites, account, permissions/groups, disk requirements, and every command required to complete setup.
-3. Verify model downloads/cache placement, database path permissions, Jabra input/output selection, GPIO access, offline startup after first asset download, and loopback Ollama operation.
+3. Verify model downloads/cache placement, database path permissions, AIRHUG 01 input/output selection, GPIO access, offline startup after explicit asset provisioning, and loopback Ollama operation.
 4. Update the runbook with any missing reproducible prerequisites; repeat on a clean environment before closing.
 
 **Close when:** A fresh supported image installs the locked profile with no undocumented manual changes and the documented command reaches working devices and local Ollama.
@@ -120,7 +121,7 @@ No further action is currently required for this revision; rerun after the next 
 - Test systemd across a Pi reboot, including reminder catch-up; test failed TTS retry and recurring reminder delivery under the unit. Restart must not produce concurrent scheduler owners or duplicate deliveries.
 - Run a longer PTT soak and verify barge-in does not crash the service.
 - Verify upgrade/rollback and journal inspection against the actual installed unit.
-- Keep wake-word disabled by default until verified. Do not add mute controls without known wiring and end-to-end gating behavior.
+- Keep source and live Pi on legacy/VOSK until custom assets and wake-word acceptance pass. Candidate startup validates checksums, manifest metadata, ONNX graph interfaces, runtime version, and feature compatibility. Verify GPIO23 mute wiring and end-to-end gating before closing this gate.
 
 **Implemented safeguards and evidence:** `--run-voice` owns the reminder scheduler as part of the same process. A per-database OS lock rejects a second scheduler process; interrupted `delivering` rows are recovered only after the lock is obtained. The deployed unit runs as dedicated `orion-service`, with `audio`/`gpio` groups, read-only application/Python/model paths, writable cache/state paths, and a 150-second graceful-stop limit. The migrated database passes SQLite integrity check and retains one reminder. The service is enabled, reached readiness, survived a manual systemd restart, and the user confirmed multi-turn voice interaction. The installed runtime's full test suite passed 140 tests and 34 subtests. Reboot, live reminder catch-up/retry/recurrence under systemd, and upgrade/rollback remain unverified.
 
@@ -130,7 +131,7 @@ No further action is currently required for this revision; rerun after the next 
 
 **Status:** Deployed in `/etc/orion/orion.env`; the service reached readiness with the intended audio, VOSK, Ollama, database, and cache configuration.
 
-**Evidence:** Missing shell-local exports previously caused the Pi to fall back to the larger default VOSK model and queue size 8. The working profile requires the small VOSK model path, `ORION_AUDIO_QUEUE_CHUNKS=100`, exact Jabra device name, Ollama backend/base URL/model, and offline Hugging Face mode after asset caching.
+**Historical evidence:** Missing shell-local exports previously caused the Pi to fall back to the larger default VOSK model and queue size 8. The prior working profile required the small VOSK model path, `ORION_AUDIO_QUEUE_CHUNKS=100`, exact Jabra device name, Ollama backend/base URL/model, and offline Hugging Face mode after asset caching. AIRHUG 01 now replaces Jabra; ALSA `default` is the configured device because AIRHUG's direct PortAudio endpoint does not support the configured 16/24 kHz rates.
 
 **Impact:** A new terminal, reboot, or service launch can silently run with different models/devices or fail to reach the intended local backend.
 
@@ -148,7 +149,7 @@ No further action is currently required for this revision; rerun after the next 
 - End-to-end and stage latency, including button-to-capture, end-of-speech, transcription, model, and TTS.
 - Repeated-turn and sustained-session temperature, throttling, swap, crashes, audio dropouts, and memory growth.
 - Power supply, cooling, ambient conditions, exact model/runtime/context details, and memory headroom.
-- VAD behavior, Jabra microphone placement, playback feedback/leakage, expected room noise, and wake-word false accepts/rejects if wake word is evaluated.
+- VAD behavior, AIRHUG 01 microphone placement, playback feedback/leakage, expected room noise, and wake-word false accepts/rejects if wake word is evaluated.
 
 The deployed source logs PTT wait, VAD/end-of-speech, STT, orchestration, planner model-call, and TTS durations without transcript content. `scripts/phase11-capture.sh` records one-second process/system resource samples and service logs. A corrected 30-second idle capture (27 samples) measured ORION RSS 487,808 KB, unloaded Ollama RSS 36,864 KB, minimum available RAM 7.69 GB, zero swap, CPU temperature 46.1-48.3 C, 0-2% process CPU, and throttle flags `0x0`. A 120-second PTT/time/reasoning capture (115 samples) measured max ORION RSS 498,672 KB, max Ollama RSS 2,393,264 KB, minimum available RAM 5.29 GB, zero swap, max temperature 58.7 C, and `0x0` throttle flags. Planner calls took 10.90 s and 8.11 s; STT took 2.49 s and 2.85 s; TTS took 6.11 s and 14.74 s. The deterministic request measured VAD 1.49 s, STT 1.63 s, and TTS 11.47 s. PTT wait (including 75.3 s of user wait) is distinct from STT. Aggregate CPU peaks were 357% ORION and 427% Ollama across cores. These preliminary short captures do not satisfy cold-start, peak-concurrency, sustained thermal, acoustic, or reliability gates.
 

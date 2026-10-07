@@ -42,7 +42,7 @@ started_epoch=$(date +%s)
     printf 'python_voice=%s\n' "$(/opt/orion/.venv-voice/bin/python --version 2>&1)"
     printf 'uv_version=%s\n' "$(/usr/local/bin/uv --version 2>&1)"
     printf 'ollama_version=%s\n' "$(ollama --version 2>&1)"
-    (cd /var/lib/orion && UV_NO_CONFIG=1 UV_CACHE_DIR=/var/cache/orion/uv-cache /usr/local/bin/uv pip show --python /opt/orion/.venv-voice/bin/python orion-assistant kittentts vosk onnxruntime gpiozero lgpio) 2>&1
+    (cd /var/lib/orion && UV_NO_CONFIG=1 UV_CACHE_DIR=/var/cache/orion/uv-cache /usr/local/bin/uv pip show --python /opt/orion/.venv-voice/bin/python orion-assistant kittentts vosk openwakeword onnxruntime gpiozero lgpio) 2>&1
     printf '\nSYSTEMD\n'
     systemctl show orion.service -p ActiveState -p SubState -p User -p Group -p ExecStart -p MainPID
     systemctl show ollama.service -p ActiveState -p SubState -p MainPID
@@ -51,7 +51,7 @@ started_epoch=$(date +%s)
     ollama show qwen3:1.7b 2>&1 || true
     ollama ps
     printf '\nSERVICE_CONFIG_NON_SECRET\n'
-    grep -E '^(ORION_MODEL_CONTEXT_SIZE|ORION_MODEL_THREADS|ORION_MODEL_NAME|ORION_MODEL_BACKEND|ORION_AUDIO_SAMPLE_RATE|ORION_AUDIO_QUEUE_CHUNKS|ORION_WAKE_WORD_ENABLED)=' /etc/orion/orion.env || true
+    grep -E '^(ORION_MODEL_CONTEXT_SIZE|ORION_MODEL_THREADS|ORION_MODEL_NAME|ORION_MODEL_BACKEND|ORION_AUDIO_SAMPLE_RATE|ORION_AUDIO_QUEUE_CHUNKS|ORION_VOICE_PROFILE|ORION_STT_BACKEND|ORION_STT_MODEL_PATH|ORION_WAKE_WORD_MODEL_PATH|ORION_WAKE_WORD_MELSPECTROGRAM_PATH|ORION_WAKE_WORD_EMBEDDING_PATH|ORION_WAKE_WORD_ENABLED)=' /etc/orion/orion.env || true
     printf '\nAUDIO_DEVICES\n'
     arecord -l 2>&1 || true
     aplay -l 2>&1 || true

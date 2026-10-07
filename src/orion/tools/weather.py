@@ -36,6 +36,11 @@ class OpenMeteoWeatherTool:
         self.policy = policy or NetworkPolicy()
 
     def execute(self, arguments, *, timeout: float, cancel_event: threading.Event) -> ToolResult:
+        if not self.settings.online_tools_enabled:
+            return ToolResult(
+                "Weather lookup is disabled in offline mode. Enable online tools to use it.",
+                success=False,
+            )
         query = str(arguments.get("query", "")).strip()
         location = str(arguments.get("location", "")).strip() or self._location_from_query(query)
         if not location:
