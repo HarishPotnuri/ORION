@@ -1,9 +1,11 @@
 # ORION
 
+For a clean Windows development machine or freshly flashed Raspberry Pi, follow [EnvironmentSetup.md](EnvironmentSetup.md). It records pinned runtimes/artifacts, SSH setup, provisioning, service setup, backup, and recovery steps.
+
 ### Clear Conversation History
 
 After wakeword activation, say "clear conversation history" to reset recent conversation context without restarting the voice service. "Clear chat history", "reset our conversation", and "wipe conversational memory" also work. The command runs without model inference and leaves saved facts, preferences, decisions, episodes, and reminders unchanged. Neither the command nor its acknowledgement enters the new conversation history. This does not correct speech recognition or remove misunderstandings already saved as durable memories.
-Local voice assistant running on Raspberry Pi 5 with custom wakeword activation, Whisper STT, local LLM (llama.cpp or Ollama), and KittenTTS
+Local voice assistant running on Raspberry Pi 5 with custom wakeword activation, Whisper STT, pinned local llama.cpp inference, and KittenTTS
 
 ## ORION local tools
 
@@ -22,12 +24,13 @@ py -3.11 -m venv .venv-local
 & .\.venv-local\Scripts\orion.exe --request "What time is it?"
 ```
 
-To test local reasoning with Ollama, set its local endpoint and model in the same PowerShell session:
+To test local reasoning, provision the pinned Qwen3.5-2B GGUF and a compatible `llama-server` build first. See [Phase 14 model and runtime pins](docs/phase14-artifacts.md). Set the local paths in the same PowerShell session:
 
 ```powershell
-$env:ORION_MODEL_BACKEND = "ollama"
-$env:ORION_MODEL_BASE_URL = "http://127.0.0.1:11434"
-$env:ORION_MODEL_NAME = "qwen3:1.7b"
+$env:ORION_MODEL_BACKEND = "llama.cpp"
+$env:ORION_MODEL_BASE_URL = "http://127.0.0.1:8080/v1"
+$env:ORION_MODEL_PATH = Join-Path $env:LOCALAPPDATA "ORION\models\Qwen3.5-2B-Q4_K_M.gguf"
+$env:ORION_LLAMA_SERVER_PATH = "C:\path\to\llama-server.exe"
 & .\.venv-local\Scripts\orion.exe --request "Explain Kafka briefly."
 ```
 
@@ -53,7 +56,7 @@ Install native build, GPIO, audio, and TTS prerequisites. `lgpio` needs SWIG, co
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential python3-dev swig liblgpio-dev libportaudio2 espeak-ng unzip curl rsync
+sudo apt install -y build-essential cmake python3-dev swig liblgpio-dev libportaudio2 espeak-ng unzip curl rsync
 ```
 
 Use the OS Python 3.13 environment for core install/tests. Use uv-managed Python 3.12 for voice because KittenTTS's current dependency chain does not resolve on this Pi's Python 3.13.
@@ -123,12 +126,9 @@ unzip -q /tmp/vosk-model.zip -d models
 rm /tmp/vosk-model.zip
 ```
 
-Install local Ollama on ARM64, pull the tested model, and use the loopback endpoint. The first KittenTTS initialization downloads its model files from Hugging Face. Even with cached assets, KittenTTS checks Hugging Face on each new process unless offline mode is enabled. After one successful online voice check, use `HF_HUB_OFFLINE=1` to force cached local assets and prevent those requests. Voice startup initializes VOSK and KittenTTS before announcing readiness, including one short discarded TTS warm-up synthesis. On the tested Pi, warm-up took 5.63 seconds online and 4.97 seconds with Hub offline; this moves the cost before readiness and out of the first reply but does not eliminate cold-start synthesis time.
+The Phase 14 source selects `llama.cpp`; Ollama is not a supported backend. Provision the pinned Qwen GGUF and build `llama-server` from the exact commit in [Phase 14 model and runtime pins](docs/phase14-artifacts.md). Do not deploy this source to the Pi until Phase 16 promotion and acceptance. The Pi's deployed revision remains on its previous runtime until then. ORION never downloads a model at startup.
 
-```sh
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen3:1.7b
-```
+KittenTTS setup remains separate. Its first initialization uses pre-provisioned local assets or a Hub cache. Set `HF_HUB_OFFLINE=1` after provisioning to block runtime downloads. Voice startup initializes VOSK and KittenTTS before announcing readiness, including one short discarded TTS warm-up synthesis. On the tested Pi, warm-up took 5.63 seconds online and 4.97 seconds with Hub offline; this moves the cost before readiness and out of the first reply but does not eliminate cold-start synthesis time.
 
 For each interactive shell, activate `.venv-voice` and configure ORION. These environment variables are required because settings revert to defaults in a new shell. Add the exports to the user's `~/.bashrc` after validating the setup if they should persist for interactive logins.
 
@@ -139,14 +139,15 @@ source .venv-voice/bin/activate
 export ORION_STT_MODEL_PATH="$HOME/orion/models/vosk-model-small-en-us-0.15"
 export ORION_AUDIO_QUEUE_CHUNKS=100
 export ORION_AUDIO_DEVICE="default"
-export ORION_MODEL_BACKEND=ollama
-export ORION_MODEL_BASE_URL=http://127.0.0.1:11434
-export ORION_MODEL_NAME=qwen3:1.7b
+export ORION_MODEL_BACKEND=llama.cpp
+export ORION_MODEL_BASE_URL=http://127.0.0.1:8080/v1
+export ORION_MODEL_PATH=/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf
+export ORION_LLAMA_SERVER_PATH=/usr/local/bin/llama-server
 # Set after a successful online voice check has cached the KittenTTS assets.
 export HF_HUB_OFFLINE=1
 ```
 
-If `ollama pull` or ORION cannot reach Ollama, confirm its local service is active with `ollama list` and `curl http://127.0.0.1:11434/api/tags`. Keep inference bound to loopback; do not expose the model endpoint to the LAN.
+Keep llama.cpp bound to loopback. Verify the model hash before provisioning. A missing model or unreachable local server must fail clearly; ORION has no alternate-provider or cloud fallback.
 
 ### Verify hardware and voice
 
@@ -168,7 +169,7 @@ orion --voice-check
 
 `orion --voice-check` should log a short transcript and speak “Local voice pipeline is ready.” In the candidate wakeword profile, say “Hey Orion” and then speak clearly; GPIO23 mutes or unmutes the microphone. The default legacy profile uses GPIO23 for push-to-talk and VOSK. Run `orion --validate-wakeword-assets` before starting the candidate service. `orion --run-voice` also needs a running local model backend; otherwise reasoning turns retry and fail with `FileNotFoundError` when no GGUF is configured for managed llama.cpp.
 
-The target is Debian 13 (trixie), kernel `6.18.50+rpt-pi-2712`, aarch64, Python 3.12.15 for voice, uv 0.12.22, and Ollama 0.35.0. The Ollama model is `qwen3:1.7b`, digest `8f68893c685c`; Python dependency versions are pinned in `uv.lock`. On the Pi, the locked profile passes `uv pip check` (98 packages), and the installed dedicated runtime passes 140 tests and 34 subtests. The owned-stream TTS fix passed 12 interruption stress cycles; the deployed schema-placeholder guard and 128-token output cap are active. The user confirmed multi-turn voice interaction works through systemd. Earlier native-abort, timeout, and placeholder failures are historical evidence, not current observed behavior. Reboot, reminder catch-up/retry/recurrence under systemd, sustained-session performance, and clean-image installation remain open.
+The target is Debian 13 (trixie), kernel `6.18.50+rpt-pi-2712`, aarch64, Python 3.12.15 for voice, uv 0.12.22, Qwen3.5-2B GGUF, and pinned llama.cpp. Phase 14 is implemented, deployed, and validated on the Pi. The locked Python profile passes `uv pip check` (98 packages), and the installed dedicated runtime passes 140 tests and 34 subtests. The owned-stream TTS fix passed 12 interruption stress cycles; the deployed schema-placeholder guard and 128-token planner cap are active. The user confirmed multi-turn voice interaction works through systemd. Earlier native-abort, timeout, and placeholder failures are historical evidence, not current observed behavior. Reboot, reminder catch-up/retry/recurrence under systemd, sustained-session performance, and clean-image installation remain open.
 
 ### Install and operate the systemd service
 
@@ -226,7 +227,7 @@ Do not overwrite an existing `/var/lib/orion/orion.sqlite3`; take and verify a b
 sudo systemctl enable --now orion.service
 ```
 
-The environment file is root-owned and group-readable by `orion-service`; it contains no credentials. The source example selects legacy/VOSK, ALSA `default`, Ollama loopback, offline Hugging Face cache, uv cache/Python directories, and the systemd-owned database. Keep this known-good fallback until all local wake assets pass manifest and ONNX compatibility validation. If the wired pins or device routing differ, edit the file before installation. Unit paths are intentionally explicit.
+The environment file is root-owned and group-readable by `orion-service`; it contains no credentials. The source example selects legacy/VOSK, ALSA `default`, pinned llama.cpp loopback, the Qwen GGUF path, offline Hugging Face cache, uv cache/Python directories, and the systemd-owned database. Keep the deployed Pi on its previous revision until Phase 16 candidate acceptance. If the wired pins or device routing differ, edit the file before installation. Unit paths are intentionally explicit.
 
 Inspect and control the service with:
 
@@ -248,7 +249,7 @@ Troubleshooting:
 - Audio device or sample-rate error: run `/opt/orion/.venv-voice/bin/python -m sounddevice` as `orion-service`, check `ORION_AUDIO_DEVICE` in `/etc/orion/orion.env`, then run input/output `check_*_settings` at ORION's configured rates. On the tested Pi, ALSA `default` accepts 16 kHz input and 24 kHz output; direct AIRHUG requires 48 kHz.
 - `Another reminder scheduler already owns this database`: keep the systemd voice service as the sole owner; stop it before any manual `--run-reminders` maintenance process.
 - TTS model unavailable with `HF_HUB_OFFLINE=1`: run the one-time online KittenTTS synthesis as `orion-service` using `HF_HOME=/var/cache/orion/huggingface`, then restore offline mode and restart the service.
-- Local reasoning unavailable: check `systemctl status ollama`, `ollama list`, and `curl http://127.0.0.1:11434/api/tags`. Keep Ollama bound to loopback.
+- Local reasoning unavailable: check the configured `ORION_LLAMA_SERVER_PATH`, `ORION_MODEL_PATH`, model SHA-256, and `curl http://127.0.0.1:8080/health`. Keep llama.cpp bound to loopback.
 
 The live Pi and source default remain on legacy/VOSK until the complete Phase 13 asset set is verified. The wakeword candidate uses GPIO23 for persistent microphone mute and GPIO16 to interrupt playback. `main.py`, `main_llama.py`, and `stt_lib.py` are historical upstream files, not supported launch commands.
 
@@ -272,13 +273,15 @@ Run local tests and CLI smoke checks:
 
 The local shortcut invokes ORION with `python -m orion`; this avoids Windows Application Control blocking the generated `orion.exe` launcher.
 
-Deploy the current worktree to the Pi. The script packages source while excluding virtual environments, models, secrets, and databases. It uploads a staging archive, stops the service, tests staged code, backs up `/opt/orion` source and the configured SQLite database via the online backup API, syncs the locked voice/Pi/test environment, tests deployed code, then starts and verifies the service. On failure, it restores source and restarts the previous service; the database backup remains for manual recovery.
+Phase 14 is the production LLM runtime. First provision the pinned GGUF and `llama-server` build described in [Phase 14 model and runtime pins](docs/phase14-artifacts.md). The deploy script verifies both pins before stopping the service. It packages source while excluding virtual environments, models, secrets, and databases; then backs up source, systemd unit, environment, and SQLite before setting the managed model keys. On failure, it restores source, unit, environment, and the previous service; the SQLite backup remains for manual recovery. This promotes the LLM runtime only; wakeword, audio, sustained performance, and fresh-image acceptance remain separate gates.
 
 ```powershell
-.\scripts\deploy-pi.ps1
-.\scripts\deploy-pi.ps1 -Target orion@192.168.1.50
+\.\scripts\deploy-pi.ps1
+\.\scripts\deploy-pi.ps1 -Target orion.local
+# Use an explicit identity only when SSH config alias is unavailable:
+\.\scripts\deploy-pi.ps1 -Target orion@192.168.0.9 -SshIdentityFile "$HOME\.ssh\orion_pi_ed25519"
 # Override if ORION_DATABASE_PATH differs from /var/lib/orion/orion.sqlite3:
-.\scripts\deploy-pi.ps1 -DatabasePath /custom/path/orion.sqlite3
+\.\scripts\deploy-pi.ps1 -DatabasePath /custom/path/orion.sqlite3
 ```
 
 Restart the Pi service without deploying:
@@ -288,4 +291,4 @@ Restart the Pi service without deploying:
 .\scripts\restart-pi.ps1 -Target orion@192.168.1.50
 ```
 
-The Pi scripts require OpenSSH Client and an SSH account authorized to run the required `sudo` commands. SSH and sudo prompts are interactive; sudo may prompt again for separate remote commands. Type credentials directly into the terminal. Scripts do not store passwords. Deployment retains source and SQLite backups under `/var/backups/orion`; it does not alter `/etc/orion/orion.env`, provision models, or migrate the database during file sync. The restarted application may perform its normal additive schema initialization. Rollback restores source/environment, not the database; keep the protected SQLite backup for manual recovery. Verify AIRHUG 01's PortAudio selector and test physical audio after deployment.
+The Pi scripts require OpenSSH Client, working public-key authentication, and an SSH account authorized to run the required `sudo` commands. Use the host alias from SSH config or pass `-SshIdentityFile` when targeting an IP; the script checks key authentication first and never falls back to SSH password prompts. Deployment asks for the Pi sudo password once, keeps it in process memory, and reuses it through SSH standard input. It disposes the cached `SecureString` when the script exits; it does not write the password to disk or include it in remote command arguments. Deployment retains source, systemd, environment, and SQLite backups under `/var/backups/orion`. It does not provision models or migrate the database during file sync. The script changes only model runtime keys in `/etc/orion/orion.env`; it preserves audio and wake settings. The restarted application may perform its normal additive schema initialization. Rollback restores source, unit, and environment, not the database; keep the protected SQLite backup for manual recovery. Verify AIRHUG 01's PortAudio selector and test physical audio after deployment.

@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,7 +21,7 @@ from ..tools.registry import ToolRegistry
 from .agent import AgentController
 from .capabilities import CapabilityPolicy
 from .context import ContextBuilder
-from .contracts import LocalModel, ToolResult
+from .contracts import LocalModel, ModelStreamEvent, ToolResult
 from .router import OrionRouter, RouteDecision, RouteKind
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,66 @@ class RequestOrchestrator:
         if self.memory is not None and request.strip() and result.response.strip():
             self.memory.add_turn(request, result.response)
         return result
+
+    def stream(
+        self, request: str, *, cancel_event: threading.Event | None = None
+    ) -> Iterator[ModelStreamEvent]:
+        decision = self.router.route(request)
+        if decision.kind != RouteKind.LLM_REASONING:
+            result = self.handle(request)
+            yield ModelStreamEvent(kind="text", text=result.response)
+            yield ModelStreamEvent(
+                kind="completed",
+                finish_reason="stop" if result.completed else "rejected",
+            )
+            return
+        capability = self.capabilities.assess(request)
+        if not capability.supported:
+            result = self.handle(request)
+            yield ModelStreamEvent(kind="text", text=result.response)
+            yield ModelStreamEvent(kind="completed", finish_reason="rejected")
+            return
+
+        agent, task_state, allowed_names = self._create_planner_agent(request)
+        started = time.monotonic()
+        delivered: list[str] = []
+        recorded = False
+        completed = False
+        try:
+            for event in agent.stream(
+                request,
+                initial_task_state=task_state,
+                allowed_tool_names=allowed_names,
+                cancel_event=cancel_event,
+            ):
+                if event.kind == "text":
+                    delivered.append(event.text)
+                elif event.kind == "completed":
+                    completed = True
+                if event.kind == "failed":
+                    if self.memory is not None:
+                        self.memory.add_turn(
+                            request,
+                            "".join(delivered),
+                            assistant_incomplete=True,
+                        )
+                        recorded = True
+                elif event.kind == "completed" and self.memory is not None:
+                    self.memory.add_turn(request, "".join(delivered))
+                    recorded = True
+                yield event
+        finally:
+            if not recorded and self.memory is not None:
+                self.memory.add_turn(
+                    request,
+                    "".join(delivered),
+                    assistant_incomplete=True,
+                )
+        logger.info(
+            "Streamed planner finished completed=%s elapsed_ms=%.1f",
+            completed,
+            (time.monotonic() - started) * 1000,
+        )
 
     def _dispatch(self, request: str, decision: RouteDecision) -> RequestResult:
         if decision.kind == RouteKind.INCOGNITO:
@@ -200,6 +260,23 @@ class RequestOrchestrator:
         return self._run_planner(request, decision)
 
     def _run_planner(self, request: str, decision: RouteDecision) -> RequestResult:
+        agent, task_state, allowed_names = self._create_planner_agent(request)
+        started = time.monotonic()
+        agent_result = agent.run(
+            request,
+            initial_task_state=task_state,
+            allowed_tool_names=allowed_names,
+        )
+        logger.info(
+            "Planner finished completed=%s reason=%s steps=%d elapsed_ms=%.1f",
+            agent_result.completed,
+            agent_result.reason,
+            agent_result.steps,
+            (time.monotonic() - started) * 1000,
+        )
+        return self._result(decision, agent_result.response, agent_result.completed)
+
+    def _create_planner_agent(self, request: str):
         allowed_names = self._authorized_agent_tools(request)
         available_tools = dict(self.tools.tools)
         for name in {"weather", "web_search"}.intersection(allowed_names):
@@ -240,20 +317,7 @@ class RequestOrchestrator:
             context_builder=self.context_builder,
             memory=self.memory,
         )
-        started = time.monotonic()
-        agent_result = agent.run(
-            request,
-            initial_task_state=task_state,
-            allowed_tool_names=allowed_names,
-        )
-        logger.info(
-            "Planner finished completed=%s reason=%s steps=%d elapsed_ms=%.1f",
-            agent_result.completed,
-            agent_result.reason,
-            agent_result.steps,
-            (time.monotonic() - started) * 1000,
-        )
-        return self._result(decision, agent_result.response, agent_result.completed)
+        return agent, task_state, allowed_names
 
     def _authorized_agent_tools(self, request: str) -> tuple[str, ...]:
         normalized = " ".join(request.casefold().split())

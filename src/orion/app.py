@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from threading import Event
 
 from .config import Settings
@@ -522,16 +522,26 @@ class _LazyLocalModel:
         self._server = None
 
     def complete(self, messages, *, max_tokens: int, timeout: float) -> str:
+        runtime = self._get_runtime()
+        return runtime.complete(messages, max_tokens=max_tokens, timeout=timeout)
+
+    def stream(self, messages, *, max_tokens, timeout, cancel_event) -> Iterator:
+        runtime = self._get_runtime()
+        yield from runtime.stream(
+            messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
+
+    def _get_runtime(self):
         if self._runtime is None:
             from .llm.runtime import LlamaCppServer, create_local_model
 
-            if self.settings.model_backend == "llama.cpp":
-                self._server = LlamaCppServer(self.settings)
-                self._server.start()
+            self._server = LlamaCppServer(self.settings)
+            self._server.start()
             self._runtime = create_local_model(self.settings)
-        return self._runtime.complete(
-            messages, max_tokens=max_tokens, timeout=timeout
-        )
+        return self._runtime
 
     def close(self) -> None:
         if self._server is not None:

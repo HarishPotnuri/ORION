@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Literal, Mapping, Protocol, Sequence
+from typing import Iterator, Literal, Mapping, Protocol, Sequence
 
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Literal["system", "user", "assistant", "tool"]
     content: str
+    incomplete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,25 @@ class MemorySuggestion:
     kind: Literal["fact", "preference", "decision"]
     content: str
     topic: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelUsage:
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStreamEvent:
+    kind: Literal["text", "usage", "completed", "failed"]
+    text: str = ""
+    usage: ModelUsage | None = None
+    finish_reason: str | None = None
+    elapsed_ms: float | None = None
+    first_token_ms: float | None = None
+    tokens_per_second: float | None = None
+    error: str | None = None
 
 
 class AudioInput(Protocol):
@@ -41,6 +61,16 @@ class LocalModel(Protocol):
         self, messages: Sequence[ChatMessage], *, max_tokens: int, timeout: float
     ) -> str:
         """Return a completion from the configured local model."""
+
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        max_tokens: int,
+        timeout: float,
+        cancel_event: threading.Event,
+    ) -> Iterator[ModelStreamEvent]:
+        """Yield bounded user-visible text and completion metadata."""
 
 
 class Tool(Protocol):

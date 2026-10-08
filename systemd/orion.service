@@ -1,7 +1,7 @@
 [Unit]
 Description=ORION local voice assistant and reminder scheduler
 Wants=network-online.target
-After=network-online.target sound.target ollama.service
+After=network-online.target sound.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -13,6 +13,7 @@ SupplementaryGroups=audio gpio
 	WorkingDirectory=/var/lib/orion
 EnvironmentFile=/etc/orion/orion.env
 Environment=PYTHONUNBUFFERED=1
+Environment=LD_LIBRARY_PATH=/opt/orion/llama.cpp/bin
 	ExecStart=/opt/orion/.venv-voice/bin/orion --run-voice
 Restart=on-failure
 RestartSec=5s

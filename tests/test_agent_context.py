@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -6,7 +7,7 @@ from dataclasses import replace
 from orion.config import Settings
 from orion.core.agent import AgentController
 from orion.core.context import ContextBudgetError, ContextBuilder
-from orion.core.contracts import ChatMessage, ToolResult
+from orion.core.contracts import ChatMessage, ModelStreamEvent, ToolResult
 from orion.memory.manager import MemoryManager
 from orion.memory.policy import MemoryCandidate, MemorySaveStatus
 from orion.memory.store import SQLiteMemoryStore
@@ -26,6 +27,19 @@ class ScriptedModel:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class StreamingModel:
+    def __init__(self, *events):
+        self.events = events
+        self.stream_calls = []
+
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("Tool-free streaming must not call complete()")
+
+    def stream(self, messages, *, max_tokens, timeout, cancel_event):
+        self.stream_calls.append((tuple(messages), max_tokens, timeout))
+        yield from self.events
 
 
 class FakeTool:
@@ -148,6 +162,17 @@ class ContextBuilderTests(unittest.TestCase):
 
         self.assertNotIn("user-facing answer", context.messages[0].content)
 
+    def test_marks_partial_assistant_turn_as_incomplete_in_new_context(self):
+        context = self.builder.build(
+            "Continue",
+            recent_messages=[
+                ChatMessage("assistant", "A partial answer", incomplete=True)
+            ],
+        )
+
+        prior_turn = next(message for message in context.messages if "partial answer" in message.content)
+        self.assertIn("Incomplete response", prior_turn.content)
+
 
 class AgentControllerTests(unittest.TestCase):
     def settings(self, **changes):
@@ -181,6 +206,72 @@ class AgentControllerTests(unittest.TestCase):
         self.assertEqual(tool.calls, [{"query": "status"}])
         self.assertFalse(tool.cancel_event.is_set())
         self.assertTrue(any("Found compact data." in message.content for message in model.calls[1][0]))
+
+    def test_tool_free_stream_skips_planner_and_filters_reasoning_tags(self):
+        model = StreamingModel(
+            ModelStreamEvent(kind="text", text="Visible <thi"),
+            ModelStreamEvent(kind="text", text="nk>private </thi"),
+            ModelStreamEvent(kind="text", text="nk> answer"),
+            ModelStreamEvent(kind="completed", finish_reason="stop"),
+        )
+
+        events = list(self.controller(model).stream("Explain Kafka"))
+
+        self.assertEqual(
+            " ".join(
+                "".join(event.text for event in events if event.kind == "text").split()
+            ),
+            "Visible answer",
+        )
+        self.assertEqual(len(model.stream_calls), 1)
+        self.assertEqual(model.stream_calls[0][1], 512)
+        self.assertNotIn("Return exactly one JSON object", model.stream_calls[0][0][0].content)
+
+    def test_reasoning_filter_handles_unicode_and_mixed_case_split_tags(self):
+        model = StreamingModel(
+            ModelStreamEvent(kind="text", text="ß<THI"),
+            ModelStreamEvent(kind="text", text="NK>private</THI"),
+            ModelStreamEvent(kind="text", text="NK>ß"),
+            ModelStreamEvent(kind="completed", finish_reason="stop"),
+        )
+
+        events = list(self.controller(model).stream("Explain Kafka"))
+
+        self.assertEqual(
+            "".join(event.text for event in events if event.kind == "text"),
+            "ßß",
+        )
+
+    def test_authorized_tool_plan_finishes_before_final_stream(self):
+        class PlanAndStreamModel(ScriptedModel):
+            def stream(self, messages, *, max_tokens, timeout, cancel_event):
+                self.streamed_messages = tuple(messages)
+                self.stream_budget = max_tokens
+                yield ModelStreamEvent(kind="text", text="The service is healthy.")
+                yield ModelStreamEvent(kind="completed", finish_reason="stop")
+
+        model = PlanAndStreamModel(
+            tool_call(arguments={"query": "status"}),
+            final("The service is healthy."),
+        )
+        tool = FakeTool()
+
+        events = list(
+            self.controller(model, tool).stream(
+                "Check status",
+                initial_task_state="Use only authorized tools.",
+                allowed_tool_names=("lookup",),
+            )
+        )
+
+        self.assertEqual(tool.calls, [{"query": "status"}])
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.stream_budget, 512)
+        self.assertEqual(
+            "".join(event.text for event in events if event.kind == "text"),
+            "The service is healthy.",
+        )
+        self.assertNotIn('"type":"tool"', " ".join(message.content for message in model.streamed_messages))
 
     def test_preserves_planner_guidance_after_each_tool_step(self):
         model = ScriptedModel(
@@ -250,6 +341,42 @@ class AgentControllerTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertEqual(result.reason, "repeated_action")
         self.assertEqual(len(tool.calls), 1)
+
+    def test_cancellation_after_planner_response_blocks_tool_execution(self):
+        cancellation = threading.Event()
+
+        class CancellingModel(ScriptedModel):
+            def complete(self, messages, *, max_tokens, timeout):
+                cancellation.set()
+                return tool_call(arguments={"query": "status"})
+
+        tool = FakeTool()
+        result = self.controller(CancellingModel(), tool).run(
+            "Check status", cancel_event=cancellation
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.reason, "cancelled")
+        self.assertEqual(tool.calls, [])
+
+    def test_cancellation_reaches_running_tool(self):
+        cancellation = threading.Event()
+
+        class CancellingTool(FakeTool):
+            def execute(self, arguments, *, timeout, cancel_event):
+                cancellation.set()
+                self.cancel_event = cancel_event
+                cancel_event.wait(0.2)
+                return ToolResult("Cancelled", success=False)
+
+        tool = CancellingTool()
+        result = self.controller(ScriptedModel(tool_call()), tool).run(
+            "Check status", cancel_event=cancellation
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.reason, "cancelled")
+        self.assertTrue(tool.cancel_event.is_set())
 
     def test_max_step_limit_stops_loop(self):
         model = ScriptedModel(

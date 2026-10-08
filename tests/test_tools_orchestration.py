@@ -7,12 +7,12 @@ from dataclasses import replace
 from datetime import datetime
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from orion.config import Settings
 from orion.core.capabilities import CapabilityPolicy
-from orion.core.contracts import ChatMessage, ToolResult
+from orion.core.contracts import ChatMessage, ModelStreamEvent, ToolResult
 from orion.core.orchestrator import RequestOrchestrator
 from orion.core.policy import NetworkPolicyError
 from orion.tools.factory import create_default_tools
@@ -22,6 +22,7 @@ from orion.tools.time import LocalTimeTool
 from orion.tools.weather import OpenMeteoWeatherTool
 from orion.tools.web_search import SearxngSearchTool
 from orion.memory.manager import MemoryManager
+from orion.memory.store import SQLiteMemoryStore
 from orion.reminders.manager import ReminderManager
 from orion.app import _LazyLocalModel, _run_request
 
@@ -34,6 +35,19 @@ class ScriptedModel:
     def complete(self, messages, *, max_tokens, timeout):
         self.calls.append((tuple(messages), max_tokens, timeout))
         return self.response
+
+
+class ScriptedStreamingModel:
+    def __init__(self, *events):
+        self.events = events
+        self.stream_calls = []
+
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("Tool-free stream must not call complete()")
+
+    def stream(self, messages, *, max_tokens, timeout, cancel_event):
+        self.stream_calls.append(tuple(messages))
+        yield from self.events
 
 
 class PlanningModel:
@@ -87,6 +101,75 @@ class CapabilityPolicyTests(unittest.TestCase):
 
 
 class LocalToolTests(unittest.TestCase):
+    def test_lazy_local_model_forwards_stream_to_initialized_runtime(self):
+        runtime = Mock()
+        runtime.stream.return_value = iter(
+            [ModelStreamEvent(kind="completed", finish_reason="stop")]
+        )
+        with patch("orion.llm.runtime.LlamaCppServer") as server_type, patch(
+            "orion.llm.runtime.create_local_model", return_value=runtime
+        ) as create_runtime:
+            model = _LazyLocalModel(Settings())
+
+            events = list(
+                model.stream(
+                    [ChatMessage("user", "Hello")],
+                    max_tokens=16,
+                    timeout=1,
+                    cancel_event=threading.Event(),
+                )
+            )
+            model.close()
+
+        self.assertEqual(events[0].kind, "completed")
+        server_type.return_value.start.assert_called_once()
+        server_type.return_value.stop.assert_called_once()
+        create_runtime.assert_called_once()
+        runtime.stream.assert_called_once()
+
+    def test_stream_failure_records_only_delivered_text_as_incomplete(self):
+        request = "Explain Kafka briefly"
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        model = ScriptedStreamingModel(
+            ModelStreamEvent(kind="text", text="Kafka moves events."),
+            ModelStreamEvent(kind="failed", error="stream_failed"),
+        )
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([]), memory=memory
+        )
+
+        events = list(orchestrator.stream(request))
+        messages = memory.recent_messages(8)
+        assistant = next(message for message in messages if message.role == "assistant")
+
+        self.assertEqual(events[-1].kind, "failed")
+        self.assertEqual(assistant.content, "Kafka moves events.")
+        self.assertTrue(assistant.incomplete)
+        self.assertEqual(sum(message.role == "assistant" for message in messages), 1)
+        self.assertEqual(len(model.stream_calls), 1)
+        memory.close()
+
+    def test_completed_stream_records_full_answer_once(self):
+        request = "Explain Kafka briefly"
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        model = ScriptedStreamingModel(
+            ModelStreamEvent(kind="text", text="Kafka moves events."),
+            ModelStreamEvent(kind="completed", finish_reason="stop"),
+        )
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([]), memory=memory
+        )
+
+        events = list(orchestrator.stream(request))
+        messages = memory.recent_messages(8)
+        assistant = next(message for message in messages if message.role == "assistant")
+
+        self.assertEqual(events[-1].kind, "completed")
+        self.assertEqual(assistant.content, "Kafka moves events.")
+        self.assertFalse(assistant.incomplete)
+        self.assertEqual(sum(message.role == "assistant" for message in messages), 1)
+        memory.close()
+
     def test_planner_logs_completion_reason_without_request_text(self):
         request = "Explain Kafka briefly"
         model = ScriptedModel(

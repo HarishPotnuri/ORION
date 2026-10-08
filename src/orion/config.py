@@ -38,9 +38,11 @@ def _env_path(name: str, default: str) -> Path:
 class Settings:
     model_backend: str = "llama.cpp"
     model_path: Path | None = None
-    model_name: str = "qwen3:1.7b"
     model_base_url: str = "http://127.0.0.1:8080/v1"
-    model_context_size: int = 8192
+    model_context_size: int = 4096
+    model_template_overhead_tokens: int = 512
+    model_answer_tokens: int = 512
+    model_planner_tokens: int = 128
     model_threads: int = 4
     model_temperature: float = 0.2
     llama_server_path: str = "llama-server"
@@ -48,7 +50,7 @@ class Settings:
     max_agent_steps: int = 5
     max_tool_execution_time: float = 15.0
     max_total_task_time: float = 120.0
-    max_context_tokens: int = 6000
+    max_context_tokens: int = 3072
     database_path: Path = Path("~/.local/share/orion/orion.sqlite3")
     memory_recent_message_limit: int = 16
     memory_search_limit: int = 5
@@ -113,14 +115,14 @@ class Settings:
         settings = cls(
             model_backend=model_backend,
             model_path=Path(model_path).expanduser() if model_path else None,
-            model_name=os.getenv("ORION_MODEL_NAME", "qwen3:1.7b"),
             model_base_url=os.getenv(
                 "ORION_MODEL_BASE_URL",
-                "http://127.0.0.1:11434"
-                if model_backend == "ollama"
-                else "http://127.0.0.1:8080/v1",
+                "http://127.0.0.1:8080/v1",
             ),
-            model_context_size=_env_int("MODEL_CONTEXT_SIZE", 8192),
+            model_context_size=_env_int("MODEL_CONTEXT_SIZE", 4096),
+            model_template_overhead_tokens=_env_int("MODEL_TEMPLATE_OVERHEAD_TOKENS", 512),
+            model_answer_tokens=_env_int("MODEL_ANSWER_TOKENS", 512),
+            model_planner_tokens=_env_int("MODEL_PLANNER_TOKENS", 128),
             model_threads=_env_int("MODEL_THREADS", 4),
             model_temperature=_env_float("MODEL_TEMPERATURE", 0.2),
             llama_server_path=os.getenv(
@@ -130,7 +132,7 @@ class Settings:
             max_agent_steps=_env_int("MAX_AGENT_STEPS", 5),
             max_tool_execution_time=_env_float("MAX_TOOL_EXECUTION_TIME", 15.0),
             max_total_task_time=_env_float("MAX_TOTAL_TASK_TIME", 120.0),
-            max_context_tokens=_env_int("MAX_CONTEXT_TOKENS", 6000),
+            max_context_tokens=_env_int("MAX_CONTEXT_TOKENS", 3072),
             database_path=_env_path(
                 "DATABASE_PATH", "~/.local/share/orion/orion.sqlite3"
             ),
@@ -247,10 +249,20 @@ class Settings:
             or self.wake_word_cooldown_seconds < 0
         ):
             raise ValueError("ORION STT timeout and microphone debounce must be positive; wake cooldown cannot be negative")
-        if self.model_backend not in {"llama.cpp", "ollama"}:
-            raise ValueError("ORION_MODEL_BACKEND must be 'llama.cpp' or 'ollama'")
+        if self.model_backend != "llama.cpp":
+            raise ValueError("ORION_MODEL_BACKEND currently supports only 'llama.cpp'")
         if self.model_context_size < 512:
             raise ValueError("ORION_MODEL_CONTEXT_SIZE must be at least 512")
+        if self.model_context_size > 4096:
+            raise ValueError("ORION_MODEL_CONTEXT_SIZE cannot exceed 4096 before larger-context validation")
+        if min(
+            self.model_template_overhead_tokens,
+            self.model_answer_tokens,
+            self.model_planner_tokens,
+        ) < 1:
+            raise ValueError("ORION model token budgets must be positive")
+        if self.model_planner_tokens > self.model_answer_tokens:
+            raise ValueError("ORION_MODEL_PLANNER_TOKENS cannot exceed answer token budget")
         if self.model_threads < 1:
             raise ValueError("ORION_MODEL_THREADS must be at least 1")
         if not 0 <= self.model_temperature <= 2:
@@ -265,6 +277,13 @@ class Settings:
             raise ValueError(
                 "ORION_MAX_CONTEXT_TOKENS must be positive and below model context size"
             )
+        if (
+            self.max_context_tokens
+            + self.model_template_overhead_tokens
+            + self.model_answer_tokens
+            > self.model_context_size
+        ):
+            raise ValueError("ORION prompt and output budgets exceed model context size")
         if self.memory_recent_message_limit < 1 or self.memory_search_limit < 1:
             raise ValueError("ORION memory limits must be positive")
         try:

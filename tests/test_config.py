@@ -17,8 +17,10 @@ class SettingsTests(unittest.TestCase):
         with self.clean_environment():
             settings = Settings.from_environment()
 
-        self.assertEqual(settings.model_context_size, 8192)
-        self.assertEqual(settings.max_context_tokens, 6000)
+        self.assertEqual(settings.model_context_size, 4096)
+        self.assertEqual(settings.max_context_tokens, 3072)
+        self.assertEqual(settings.model_answer_tokens, 512)
+        self.assertEqual(settings.model_planner_tokens, 128)
         self.assertEqual(settings.model_backend, "llama.cpp")
         self.assertEqual(settings.model_base_url, "http://127.0.0.1:8080/v1")
         self.assertEqual(settings.memory_recent_message_limit, 16)
@@ -107,8 +109,18 @@ class SettingsTests(unittest.TestCase):
                 Settings.from_environment()
 
     def test_rejects_invalid_context_budget(self) -> None:
-        with self.clean_environment({"ORION_MAX_CONTEXT_TOKENS": "8192"}):
+        with self.clean_environment({"ORION_MAX_CONTEXT_TOKENS": "4096"}):
             with self.assertRaisesRegex(ValueError, "below model context size"):
+                Settings.from_environment()
+
+    def test_rejects_8192_context_until_explicitly_validated(self) -> None:
+        with self.clean_environment({"ORION_MODEL_CONTEXT_SIZE": "8192"}):
+            with self.assertRaisesRegex(ValueError, "before larger-context validation"):
+                Settings.from_environment()
+
+    def test_rejects_ollama_backend(self) -> None:
+        with self.clean_environment({"ORION_MODEL_BACKEND": "ollama"}):
+            with self.assertRaisesRegex(ValueError, "only 'llama.cpp'"):
                 Settings.from_environment()
 
     def test_rejects_reused_gpio_pins(self) -> None:

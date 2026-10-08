@@ -4,7 +4,7 @@
 
 Build ORION as a privacy-first, offline-by-default personal voice assistant for Raspberry Pi 5 with 8 GB RAM and Raspberry Pi OS Lite 64-bit. The target uses wakeword-only activation, local speech recognition, streamed local responses, persistent reminders, and user-controlled memory.
 
-The foundation and Phase 12 planner are implemented. Remaining work is Pi acceptance for Phases 9–13 and implementation/validation of Phases 14–16. Broader memory and semantic retrieval are deferred.
+The foundation and Phase 12 planner are implemented. Phase 14 source and a verified Qwen3.5-2B GGUF are local. The owner confirms Phase 14 is deployed and validated on Pi as of 2026-10-08. This session could not independently recheck the live host because SSH timed out. Phases 9–13 hardware acceptance and remaining Phase 16 gates stay separate; Phase 15 and broader memory/semantic retrieval remain planned or deferred.
 
 ## Product and Engineering Principles
 
@@ -14,9 +14,9 @@ The foundation and Phase 12 planner are implemented. Remaining work is Pi accept
 - Keep authorization and side effects deterministic; route clear local actions directly and compound requests through the bounded planner.
 - Treat Pi compatibility and performance as unverified until measured on target hardware.
 
-## Current Status (2026-10-06)
+## Current Status (2026-10-08)
 
-Foundation Phases 1–8 and Phase 12 are implemented. The Pi currently runs Ollama `qwen3:1.7b`, VOSK, KittenTTS, SQLite, and systemd; GPIO23 is still configured as PTT. The Phase 13 target code is local, not deployed; wake assets and Pi acceptance remain open. Phases 14–16 are planned.
+Foundation Phases 1–8 and Phase 12 are implemented. Phase 14 source, pinned Qwen3.5-2B artifact, deployment, and Pi validation are reported complete by the owner. The deploy script uses Phase 14 by default. This workstation could not independently recheck the live Pi because SSH timed out. Phase 13 wake assets and Pi acceptance remain open. Phase 15 and the remaining Phase 16 gates remain planned.
 
 Status terms in this plan:
 
@@ -48,7 +48,7 @@ The implemented foundation provides a modular Python package, validated settings
 ## Pi Acceptance Gates (Phases 9–11)
 
 - **Installation:** prove a clean Raspberry Pi OS Lite 64-bit installation with the locked Python 3.12 voice environment, service account, GPIO/audio permissions, provisioned models, and writable SQLite. Existing-Pi dependency checks do not prove a clean-image install.
-- **Current target:** Raspberry Pi 5 8 GB, Debian 13/aarch64, AIRHUG 01 via ALSA `default`, Python 3.12 via uv, Ollama `qwen3:1.7b`, VOSK, and KittenTTS. Direct AIRHUG accepts 48 kHz only; ORION requires 16 kHz capture and 24 kHz playback. GPIO16 is speech interruption.
+- **Deployed pre-migration baseline:** Raspberry Pi 5 8 GB, Debian 13/aarch64, AIRHUG 01 via ALSA `default`, Python 3.12 via uv, Ollama `qwen3:1.7b`, VOSK, and KittenTTS. Direct AIRHUG accepts 48 kHz only; ORION requires 16 kHz capture and 24 kHz playback. GPIO16 is speech interruption.
 - **Service/recovery:** systemd and the dedicated account are installed. Verify reboot startup, reminder recovery/retry/recurrence, clean shutdown, and exclusive scheduler ownership.
 - **Reliability/performance:** initial captures exist. Still verify cold start, repeated turns, a 30-minute soak, thermal/throttle/swap behavior, acoustics, playback leakage, and latency/resource limits. Publish only Pi-measured results.
 
@@ -91,7 +91,9 @@ Acceptance criteria:
 - Missing local assets fail clearly without network access or alternate-provider/phrase fallback. Captured audio never reaches disk.
 - Mocked wake-to-VAD-to-transcript integration, cancellation, error cleanup, and existing privacy/tool tests pass.
 
-### Phase 14: Qwen Runtime and Safe Streaming Generation - Planned
+### Phase 14: Qwen Runtime and Safe Streaming Generation - Implemented, Deployed, and Pi-Validated
+
+Progress checkpoint (2026-10-08): Removed Ollama backend support. Added pinned-model context budgets, llama.cpp template/tokenizer budget checks, local SSE decoding and cancellation, typed stream events, tool-free direct streams, buffered tool planning before final generation, incomplete-turn labeling, and delayed memory suggestions. Tests cover arbitrary SSE byte splits, Unicode, malformed/truncated streams, reasoning suppression, tool gating, budgets, cancellation, and partial-turn recording. The Q4_K_M artifact is pinned and SHA-256 verified on Windows and Pi. Built and installed the pinned llama.cpp commit on Pi; model load, health, `/props`, `/apply-template`, `/tokenize`, and streamed completion passed smoke tests. The owner confirms the production Phase 14 deployment and Pi validation are complete. The deploy script selects this runtime by default, verifies model/build pins before stopping the service, changes only managed model settings, and backs up/restores environment and unit files. This session could not independently recheck the host because SSH timed out. Broader Phase 16 acceptance remains open; see `docs/phase14-artifacts.md`.
 
 1. Select and checksum the actual Qwen3.5-2B `Q4_K_M` GGUF, not the Base variant, and pin/smoke-test its llama.cpp build and chat template. Start with 4096 context tokens, a 3072-token input budget, up to 512 answer tokens, and 512 tokens reserved for template/safety overhead. Validate formatted prompt plus output capacity through the runtime tokenizer/template path. Allow 8192 only after validation. Keep the planner cap separately bounded, initially 128 tokens.
 2. Add typed streaming events and policy-preserving SSE transport with incremental UTF-8/event decoding, response bounds, finish/`[DONE]` handling, usage/timings, absolute deadlines, cancellation, and connection cleanup. Retain `complete()` for buffered consumers. Reject remote endpoints, redirects, and hidden cloud fallback.
@@ -195,7 +197,7 @@ Keep validated configuration centralized. Before promotion, record supported OS/
 ## Known Limits
 
 - Custom “Hey Orion” assets are absent. The wake profile fails closed until they are provisioned; wake acoustics and mute persistence are not Pi-verified.
-- A pinned Whisper CLI/model stdin check passed on Pi; full ORION integration, local/offline TTS, reboot recovery, and sustained performance remain unverified. Phase 14–15 runtimes are not implemented.
+- A pinned Whisper CLI/model stdin check passed on Pi; full ORION integration, local/offline TTS, reboot recovery, and sustained performance remain unverified. Phase 14 is implemented, deployed, and Pi-validated; Phase 15 is not implemented.
 - Incognito resets on process restart. SearXNG remains unavailable until an exact HTTPS host is configured.
 
 ## Immediate Milestone and Handoff

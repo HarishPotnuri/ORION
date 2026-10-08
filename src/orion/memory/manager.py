@@ -38,11 +38,19 @@ class VolatileConversation:
             raise ValueError("Conversation buffer accepts only user and assistant messages")
         self._messages.append(message)
 
-    def add_turn(self, user_text: str, assistant_text: str) -> None:
+    def add_turn(
+        self, user_text: str, assistant_text: str, *, assistant_incomplete: bool = False
+    ) -> None:
         if user_text.strip():
             self.add_message(ChatMessage(role="user", content=user_text.strip()))
         if assistant_text.strip():
-            self.add_message(ChatMessage(role="assistant", content=assistant_text.strip()))
+            self.add_message(
+                ChatMessage(
+                    role="assistant",
+                    content=assistant_text.strip(),
+                    incomplete=assistant_incomplete,
+                )
+            )
 
     def recent_messages(self, limit: int) -> Sequence[ChatMessage]:
         if limit < 1:
@@ -87,8 +95,12 @@ class MemoryManager:
     def set_incognito(self, enabled: bool) -> None:
         self._incognito = bool(enabled)
 
-    def add_turn(self, user_text: str, assistant_text: str) -> None:
-        self.conversation.add_turn(user_text, assistant_text)
+    def add_turn(
+        self, user_text: str, assistant_text: str, *, assistant_incomplete: bool = False
+    ) -> None:
+        self.conversation.add_turn(
+            user_text, assistant_text, assistant_incomplete=assistant_incomplete
+        )
 
     def recent_messages(self, limit: int) -> Sequence[ChatMessage]:
         return self.conversation.recent_messages(limit)

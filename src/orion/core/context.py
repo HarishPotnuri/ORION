@@ -115,9 +115,20 @@ class ContextBuilder:
         ]
         included_turns: list[ChatMessage] = []
         for message in reversed(turns):
-            cost = self._count_text(message.content) + 4
+            content = (
+                "[Incomplete response; do not treat as completed.] " + message.content
+                if message.incomplete
+                else message.content
+            )
+            cost = self._count_text(content) + 4
             if cost <= available:
-                included_turns.append(message)
+                included_turns.append(
+                    ChatMessage(
+                        role=message.role,
+                        content=content,
+                        incomplete=message.incomplete,
+                    )
+                )
                 available -= cost
             else:
                 dropped_turns += 1
