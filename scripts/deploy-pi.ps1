@@ -8,6 +8,7 @@ param(
     [string]$SshIdentityFile,
     [string]$DatabasePath = "/var/lib/orion/orion.sqlite3",
     [switch]$EnableJarvisWakeWord,
+    [switch]$DisableJarvisWakeWord,
     [ValidateRange(0.0, 1.0)]
     [double]$WakeWordThreshold = 0.08,
     [string]$RemoteModelRoot,
@@ -15,6 +16,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$UseJarvisWakeWord = $EnableJarvisWakeWord -or -not $DisableJarvisWakeWord
 
 function Assert-ExitCode([string]$Step) {
     if ($LASTEXITCODE -ne 0) {
@@ -206,7 +208,14 @@ values = {
     "ORION_MAX_CONTEXT_TOKENS": "3072",
     "ORION_MODEL_ANSWER_TOKENS": "512",
     "ORION_MODEL_PLANNER_TOKENS": "128",
-    "ORION_WAKEWORD_MODEL_ID": "hey-orion",
+    "ORION_VOICE_PROFILE": "legacy",
+    "ORION_STT_BACKEND": "vosk",
+    "ORION_STT_MODEL_ID": "vosk-en-small",
+    "ORION_VOSK_MODEL_PATH": str(pathlib.Path(sys.argv[5]) / "vosk-model-small-en-us-0.15"),
+    "ORION_TTS_BACKEND": "piper",
+    "ORION_TTS_MODEL_ID": "piper-lessac-medium",
+    "ORION_WAKEWORD_MODEL_ID": "hey-jarvis",
+    "ORION_WAKE_WORD_ENABLED": "false",
 }
 if values["ORION_MODEL_PATH"] is None:
     raise SystemExit("Q4 GGUF is missing from canonical and legacy model paths")
@@ -266,7 +275,7 @@ try {
     $excludedFiles = @("*.pyc", "*.pyo", "*.sqlite", "*.sqlite-*", "*.sqlite3", "*.sqlite3-*", "*.db", "*.db-*", "*.sqlite3-wal", "*.sqlite3-shm")
 
     [void](Add-SourceDirectory $root $root $zip $excludedDirectories $excludedFiles)
-    if ($EnableJarvisWakeWord) {
+    if ($UseJarvisWakeWord) {
         $jarvisModel = Join-Path $root "models/hey_jarvis.onnx"
         if (-not (Test-Path -LiteralPath $jarvisModel -PathType Leaf)) {
             throw "Jarvis model not found: $jarvisModel"
@@ -409,7 +418,7 @@ try {
         "sudo rsync -a --delete --chown=root:orion-service --exclude=.venv-local/ --exclude=.venv/ --exclude=.venv-voice/ --exclude=models/ --exclude=llama.cpp/ --exclude=python/ --exclude=.git/ --exclude=src/orion_assistant.egg-info/ --exclude='__pycache__/' --exclude='*.sqlite3' --exclude='*.sqlite3-wal' --exclude='*.sqlite3-shm' $rootQuoted/ $backupQuoted/"
     ) -join " && "
     Invoke-Pi $backupCommand "Source backup"
-    if ($EnableJarvisWakeWord) {
+    if ($UseJarvisWakeWord) {
         $jarvisBackup = @(
             "if sudo test -f $(Quote-Remote "$RemoteModelRoot/WAKEWORD/hey_jarvis.onnx"); then sudo install -D -m 0640 $(Quote-Remote "$RemoteModelRoot/WAKEWORD/hey_jarvis.onnx") $backupQuoted/models/hey_jarvis.onnx; fi"
         ) -join " && "
@@ -431,7 +440,7 @@ try {
         "sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=$(Quote-Remote $remotePythonInstall) UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=$(Quote-Remote $remoteEnvironment) $uvQuoted sync --locked --no-editable --no-install-package tflite-runtime --extra voice --extra wakeword --extra embedding --extra pi --extra test --python 3.12 --project $rootQuoted",
         "cd $rootQuoted"
     )
-    if ($EnableJarvisWakeWord) {
+    if ($UseJarvisWakeWord) {
         $deployCommand += @(
             "sudo install -d -o orion-service -g orion-service -m 0750 $(Quote-Remote "$RemoteModelRoot/WAKEWORD")",
             "sudo install -o orion-service -g orion-service -m 0640 $(Quote-Remote "$remoteStage/models/hey_jarvis.onnx") $(Quote-Remote "$RemoteModelRoot/WAKEWORD/hey_jarvis.onnx")"
@@ -444,7 +453,7 @@ try {
         "sudo systemctl daemon-reload",
         "sudo systemctl enable $serviceQuoted"
     )
-    if ($EnableJarvisWakeWord) {
+    if ($UseJarvisWakeWord) {
         $jarvisEnvironmentPython = @'
 import os, pathlib, re, sys, tempfile
 path = pathlib.Path(sys.argv[1])
@@ -516,7 +525,7 @@ finally:
 
     Write-Host "Registered Pi model inventory on Pi (see path and detail for local asset status):"
     try {
-        $modelInventory = "sudo -u orion-service env HOME=/var/lib/orion ORION_MODEL_ROOT=$(Quote-Remote $RemoteModelRoot) $(Quote-Remote "$remoteEnvironment/bin/orion-model") list"
+        $modelInventory = "sudo -u orion-service env HOME=/var/lib/orion ORION_MODEL_ROOT=$(Quote-Remote $RemoteModelRoot) ORION_STT_MODEL_ID=vosk-en-small ORION_VOSK_MODEL_PATH=$(Quote-Remote "$RemoteModelRoot/vosk-model-small-en-us-0.15") ORION_TTS_MODEL_ID=piper-lessac-medium ORION_WAKEWORD_MODEL_ID=hey-jarvis $(Quote-Remote "$remoteEnvironment/bin/orion-model") list"
         Invoke-Pi $modelInventory "Registered Pi model inventory"
     }
     catch {
@@ -550,7 +559,7 @@ catch {
             "sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=$(Quote-Remote $remotePythonInstall) UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=$(Quote-Remote $remoteEnvironment) $uvQuoted sync --locked --no-editable --no-install-package tflite-runtime --extra voice --extra wakeword --extra embedding --extra pi --extra test --python 3.12 --project $rootQuoted",
             "sudo systemctl daemon-reload"
         )
-        if ($EnableJarvisWakeWord) {
+        if ($UseJarvisWakeWord) {
             $rollback += @(
                 "if sudo test -f $backupQuoted/models/hey_jarvis.onnx; then sudo install -d -o orion-service -g orion-service -m 0750 $(Quote-Remote "$RemoteModelRoot/WAKEWORD") && sudo install -o orion-service -g orion-service -m 0640 $backupQuoted/models/hey_jarvis.onnx $(Quote-Remote "$RemoteModelRoot/WAKEWORD/hey_jarvis.onnx"); else sudo rm -f $(Quote-Remote "$RemoteModelRoot/WAKEWORD/hey_jarvis.onnx"); fi"
             )

@@ -381,12 +381,24 @@ ORION_MODEL_ANSWER_TOKENS=512
 ORION_MODEL_PLANNER_TOKENS=128
 ORION_VOICE_PROFILE=legacy
 ORION_STT_BACKEND=vosk
+ORION_STT_MODEL_ID=vosk-en-small
+ORION_TTS_BACKEND=piper
+ORION_TTS_MODEL_ID=piper-lessac-medium
+ORION_WAKEWORD_MODEL_ID=hey-jarvis
+ORION_WAKE_WORD_ENABLED=true
+ORION_WAKE_WORD_MODEL_PATH=/opt/orion/models/WAKEWORD/hey_jarvis.onnx
+ORION_WAKE_WORD_MELSPECTROGRAM_PATH=/opt/orion/artifacts/wakeword-staging/melspectrogram.onnx
+ORION_WAKE_WORD_EMBEDDING_PATH=/opt/orion/artifacts/wakeword-staging/embedding_model.onnx
+ORION_WAKE_WORD_THRESHOLD=0.08
+ORION_WAKE_WORD_COOLDOWN_SECONDS=3.0
 ORION_ONLINE_TOOLS_ENABLED=false
 HF_HUB_OFFLINE=1
 HF_HOME=/var/cache/orion/huggingface
 UV_CACHE_DIR=/var/cache/orion/uv-cache
 UV_PYTHON_INSTALL_DIR=/opt/orion/python
 ```
+
+The production deployment defaults to Hey Jarvis wakeword capture, VOSK small English, and the local Piper Lessac voice. Use `-DisableJarvisWakeWord` only to return a deployment to push-to-talk mode. Hey Orion remains a candidate and is not activated without its provenance manifest and acoustic acceptance.
 
 The selection file defaults to `/var/lib/orion/model-selection.json`, beside SQLite. Keep it writable by `orion-service`. Run model commands as that account so selection survives service restart:
 

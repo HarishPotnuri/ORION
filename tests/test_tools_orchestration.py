@@ -4,7 +4,7 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -813,12 +813,13 @@ class OrchestrationTests(unittest.TestCase):
                 "Remind me tomorrow at 1 PM about project meeting",
                 now=datetime(2026, 9, 28, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata")),
             )
+            target_day = datetime.now(ZoneInfo("Asia/Kolkata")) + timedelta(days=1)
             orchestrator = RequestOrchestrator(
                 settings, model, tool_registry, reminders=manager
             )
             try:
                 updated = orchestrator.handle(
-                    "Reschedule my project meeting reminder to Friday at 3 PM"
+                    f"Reschedule my project meeting reminder to {target_day:%A} at 3 PM"
                 )
                 noted = orchestrator.handle(
                     "Add notes to the project meeting reminder: bring performance test results"
@@ -826,7 +827,10 @@ class OrchestrationTests(unittest.TestCase):
 
                 stored = manager.get(reminder.id)
                 self.assertEqual(updated.response, "Updated reminder: project meeting.")
-                self.assertEqual(stored.due_at.astimezone(ZoneInfo("Asia/Kolkata")).weekday(), 4)
+                self.assertEqual(
+                    stored.due_at.astimezone(ZoneInfo("Asia/Kolkata")).weekday(),
+                    target_day.weekday(),
+                )
                 self.assertEqual(stored.due_at.astimezone(ZoneInfo("Asia/Kolkata")).hour, 15)
                 self.assertIn("Updated reminder", noted.response)
                 self.assertEqual(stored.notes, "bring performance test results")
