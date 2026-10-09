@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orion.audio.capture import AudioBufferOverflow, AudioGate, SoundDeviceChunkSource
-from orion.audio.stt import PushToTalkInput, VoskTranscriber
+from orion.audio.stt import PushToTalkInput, VoskTranscriber, WhisperPushToTalkInput
 from orion.audio.tts import KittenSpeechOutput
 from orion.audio.vad import VoiceActivityDetector
 from orion.audio.wakeword import OpenWakeWordDetector
@@ -130,6 +130,34 @@ class AudioTests(unittest.TestCase):
         self.assertIn("stage=stt", logs.output[-1])
         self.assertIn("outcome=transcribed", logs.output[-1])
         self.assertNotIn("recognized words", logs.output[-1])
+
+    def test_whisper_ptt_uses_vad_pcm_in_memory(self):
+        settings = self.small_settings()
+        audio = [pcm(1000, 10), pcm(1000, 10), pcm(0, 10), pcm(0, 10), pcm(0, 10)]
+        captured = []
+
+        class FakeTranscriber:
+            def transcribe(self, pcm_data, *, cancel_event, timeout):
+                captured.append((pcm_data, cancel_event.is_set(), timeout))
+                return "recognized locally"
+
+            def close(self):
+                pass
+
+        class FakeSource:
+            def chunks(self, _stop_event=None):
+                yield from audio
+
+        whisper_input = WhisperPushToTalkInput(
+            settings,
+            object(),
+            FakeTranscriber(),
+            source=FakeSource(),
+        )
+        self.assertEqual(whisper_input.transcribe_chunks(iter(audio)), "recognized locally")
+        self.assertEqual(captured[0][0], b"".join(audio))
+        self.assertFalse(captured[0][1])
+        self.assertEqual(captured[0][2], settings.stt_timeout)
 
     def test_push_to_talk_confirmation_timeout_does_not_stop_service(self):
         service_stop = threading.Event()

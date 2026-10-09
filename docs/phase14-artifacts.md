@@ -7,6 +7,7 @@
 - File: `Qwen3.5-2B-Q4_K_M.gguf`.
 - Expected size: 1,280,835,840 bytes.
 - Verified SHA-256: `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223`.
+- Accepted operational Pi/depot copy (owner-approved 2026-10-09): 1,312,165,056 bytes, SHA-256 `a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b`. This fingerprint matches current Pi and local depot, but does **not** match the immutable upstream revision hash above. Its exact source/repackaging difference remains unknown; deploy uses this accepted fingerprint.
 - The repository metadata identifies `Qwen/Qwen3.5-2B`, not `Qwen3.5-2B-Base`. Its model card states that the weights are post-trained.
 - Do not provision `mmproj` files. ORION uses text-only inference.
 - Keep model artifacts outside this source repository. Set `ORION_MODEL_PATH` to the verified local file.
@@ -21,7 +22,7 @@ Invoke-WebRequest -Uri 'https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f
 (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
 ```
 
-The local Windows download was verified at 1,280,835,840 bytes with the SHA-256 above. **Pi provisioning record (2026-10-07):** copied the verified GGUF to `/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf`; SHA-256 matches. Built llama.cpp at the pinned commit and installed the binary plus colocated libraries under `/opt/orion/llama.cpp/bin`, with `/usr/local/bin/llama-server` symlink. The installed server loaded the model, passed health, `/props`, `/apply-template`, `/tokenize`, and streamed completion checks. **Production validation (owner-reported, 2026-10-08):** owner confirms Phase 14 was deployed and validated on Pi. The repository deploy path uses Phase 14 by default. This session could not independently recheck the live host because SSH timed out. Broader Phase 16 acceptance remains separate.
+The original local Windows download from the pinned revision was recorded at 1,280,835,840 bytes with the upstream SHA-256 above. **Pi provisioning record (2026-10-07):** copied a model file to `/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf`; it was then reported to match the upstream hash. **Operational fingerprint update (owner-approved, 2026-10-09):** current Pi and adjacent depot files are both 1,312,165,056 bytes with SHA-256 `a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b`. Owner reports the Pi model is working and approves deployment against this fingerprint. Do not describe this copy as matching the pinned upstream revision until its provenance difference is resolved. Built llama.cpp at the pinned commit; production validation remains owner-reported. Broader Phase 16 acceptance remains separate.
 
 For a new Pi, download the same immutable revision and verify before changing the service environment:
 

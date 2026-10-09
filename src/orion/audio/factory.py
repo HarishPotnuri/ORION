@@ -3,7 +3,7 @@
 from ..config import Settings
 from .capture import AudioGate
 from .stt import VoskTranscriber
-from .tts import KittenSpeechOutput
+from .tts import KittenSpeechOutput, PiperSpeechOutput
 from .whisper import WhisperCppTranscriber
 
 
@@ -18,4 +18,6 @@ def create_transcriber(settings: Settings):
 def create_speech_output(settings: Settings, gate: AudioGate):
     if settings.tts_backend == "kittentts":
         return KittenSpeechOutput(settings, gate)
+    if settings.tts_backend == "piper":
+        return PiperSpeechOutput(settings, gate)
     raise ValueError(f"Unsupported TTS backend: {settings.tts_backend}")

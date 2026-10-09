@@ -54,6 +54,8 @@ class WakeListenerInput:
         self._turn_cancel = threading.Event()
         self._control_cancel = self.control.cancel_event
         self._turn_token = None
+        self._pending_barge_in = None
+        self._barge_in_ready = threading.Event()
         self._call_lock = threading.Lock()
         self._worker = None
         self._last_capture_error = None
@@ -81,13 +83,15 @@ class WakeListenerInput:
             self._turn_phase = "idle"
             self._armed.clear()
         self._clear_results()
+        self._pending_barge_in = None
+        self._barge_in_ready.clear()
         if self._worker is not None:
             if not self._session_closed.wait(1.0):
                 logger.error("Microphone capture did not close within its shutdown budget")
 
     def _listen(self):
         while not self.stop_event.is_set():
-            if self.control.muted or not self.gate.is_open:
+            if self.control.muted or not self.gate.wakeword_capture_allowed:
                 self.stop_event.wait(0.05)
                 continue
             token = self.control.generation
@@ -99,7 +103,7 @@ class WakeListenerInput:
             terminal_error = None
             capture_failed = False
             try:
-                if not self.control.allows(token) or not self.gate.is_open:
+                if not self.control.allows(token) or not self.gate.wakeword_capture_allowed:
                     continue
                 self.detector.reset()
                 session = _Cancelled(self.stop_event, cancelled, self._session_stop)
@@ -116,7 +120,7 @@ class WakeListenerInput:
                     if chunk is None:
                         break
                     self._last_capture_error = None
-                    if not self.gate.is_open:
+                    if not self.gate.wakeword_capture_allowed:
                         self._session_stop.set()
                         break
                     current_gate_generation = self.gate.generation
@@ -141,26 +145,45 @@ class WakeListenerInput:
                                 and self._turn_phase == "listening"
                                 and time.monotonic() < self._turn_deadline
                             )
+                            barge_in = (
+                                active_turn is None
+                                and self.gate.turn_active
+                                and self.gate.allow_wakeword_during_speech
+                            )
                         if self.gate.generation != gate_generation:
                             frame.clear()
                             self.detector.reset()
                             gate_generation = self.gate.generation
                             continue
                         if detected:
-                            activated = still_armed
+                            activated = still_armed or barge_in
                             if activated:
                                 logger.info("Wake word detected")
+                                if barge_in:
+                                    self.gate.request_interrupt()
                                 if self.on_wake is not None:
                                     self.on_wake()
                             break
                     if not activated:
                         continue
                     with self._turn_lock:
-                        if self._active_turn != active_turn or self._turn_phase != "listening":
-                            continue
-                        self._turn_phase = "capturing"
-                        turn_deadline = self._turn_deadline
-                        turn_cancel = self._turn_cancel
+                        if barge_in:
+                            if not self.gate.turn_active or self._active_turn is not None:
+                                continue
+                            self._turn_sequence += 1
+                            active_turn = self._turn_sequence
+                            self._active_turn = active_turn
+                            self._turn_phase = "capturing"
+                            turn_deadline = time.monotonic() + self.settings.max_utterance_seconds + 2
+                            turn_cancel = threading.Event()
+                            self._turn_deadline = turn_deadline
+                            self._armed.set()
+                        else:
+                            if self._active_turn != active_turn or self._turn_phase != "listening":
+                                continue
+                            self._turn_phase = "capturing"
+                            turn_deadline = self._turn_deadline
+                            turn_cancel = self._turn_cancel
                     frame.clear()
                     turn_stop = _Cancelled(
                         self.stop_event, cancelled, self._session_stop, turn_cancel,
@@ -169,8 +192,10 @@ class WakeListenerInput:
 
                     def speech_chunks():
                         for speech in chunks:
-                            if turn_stop.is_set() or not self.gate.is_open:
+                            if turn_stop.is_set():
                                 break
+                            if not self.gate.is_open:
+                                continue
                             if len(speech) != self.settings.audio_block_frames * 2:
                                 raise ValueError("Capture returned an invalid mono PCM block")
                             yield speech
@@ -183,8 +208,13 @@ class WakeListenerInput:
                             and time.monotonic() < self._turn_deadline
                         )
                         if owns_turn and not turn_stop.is_set() and self.control.allows(token):
-                            self._turn_phase = "transcribing"
-                            self._results.put_nowait((active_turn, token, cancelled, turn_cancel, pcm))
+                            if barge_in:
+                                self._pending_barge_in = (token, cancelled, pcm)
+                                self._barge_in_ready.set()
+                                self._finish_turn(active_turn)
+                            else:
+                                self._turn_phase = "transcribing"
+                                self._results.put_nowait((active_turn, token, cancelled, turn_cancel, pcm))
                         elif self._active_turn == active_turn:
                             self._finish_turn(active_turn)
                     self.detector.reset()
@@ -241,6 +271,25 @@ class WakeListenerInput:
             self._clear_results()
             self._turn_token = None
             deadline = float("inf") if timeout is None else time.monotonic() + timeout
+            pending_barge_in = self._pending_barge_in
+            self._pending_barge_in = None
+            self._barge_in_ready.clear()
+            if pending_barge_in is not None:
+                token, captured_cancel, pcm = pending_barge_in
+                if not self.control.allows(token) or not pcm:
+                    return ""
+                remaining = min(self.settings.stt_timeout, deadline - time.monotonic())
+                if remaining <= 0:
+                    return ""
+                text = self.transcriber.transcribe(
+                    pcm,
+                    cancel_event=_Cancelled(self.stop_event, captured_cancel, deadline=deadline),
+                    timeout=remaining,
+                )
+                if self.control.allows(token) and not self.stop_event.is_set():
+                    self._turn_token = token
+                    return text
+                return ""
             with self._turn_lock:
                 self._turn_sequence += 1
                 turn_id = self._turn_sequence

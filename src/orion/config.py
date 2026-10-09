@@ -12,6 +12,15 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core.policy import NetworkPolicy, NetworkPolicyError
+from .models import (
+    ModelSelectionStore,
+    WAKEWORD_EMBEDDING_FILENAME,
+    WAKEWORD_MANIFEST_FILENAME,
+    WAKEWORD_MELSPECTROGRAM_FILENAME,
+    default_model_root,
+    get_model,
+    resolve_model_path,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -36,6 +45,13 @@ def _env_path(name: str, default: str) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    model_root: Path = Path("/opt/orion/models")
+    model_selection_path: Path = Path("~/.local/share/orion/model-selection.json")
+    active_llm_model: str = "qwen3.5-2b-q4"
+    active_stt_model: str = "vosk-en-small"
+    active_tts_model: str = "kittentts-nano"
+    active_embedding_model: str = "bge-small-en-v1.5"
+    active_wakeword_model: str = "hey-orion"
     model_backend: str = "llama.cpp"
     model_path: Path | None = None
     model_base_url: str = "http://127.0.0.1:8080/v1"
@@ -66,6 +82,8 @@ class Settings:
     stt_timeout: float = 30.0
     whisper_cli_path: str = "whisper-cli"
     tts_backend: str = "kittentts"
+    tts_threads: int = 2
+    runtime_idle_timeout: float = 60.0
     wake_word_model_path: Path | None = None
     wake_word_melspectrogram_path: Path | None = None
     wake_word_embedding_path: Path | None = None
@@ -86,6 +104,7 @@ class Settings:
     wake_word_enabled: bool = False
     wake_word_threshold: float = 0.5
     stt_model_path: Path = Path("models/vosk-model-en-us-0.22-lgraph")
+    vosk_model_path: Path = Path("models/vosk-model-en-us-0.22-lgraph")
     tts_voice: str = "expr-voice-3-f"
     tts_sample_rate: int = 24000
     push_to_talk_pin: int = 23
@@ -101,25 +120,113 @@ class Settings:
     def from_environment(cls) -> Settings:
         model_backend = os.getenv("ORION_MODEL_BACKEND", "llama.cpp").lower()
         voice_profile = os.getenv("ORION_VOICE_PROFILE", "legacy").lower()
-        default_stt_backend = "whisper.cpp" if voice_profile == "wakeword" else "vosk"
-        stt_backend = os.getenv("ORION_STT_BACKEND", default_stt_backend).lower()
         wake_word_enabled = os.getenv("ORION_WAKE_WORD_ENABLED", "false").lower() in {
             "1", "true", "yes", "on"
         }
+        database_path = _env_path(
+            "DATABASE_PATH", "~/.local/share/orion/orion.sqlite3"
+        )
+        model_root = Path(
+            os.getenv("ORION_MODEL_ROOT", str(default_model_root()))
+        ).expanduser().resolve()
+        selection_path = Path(
+            os.getenv(
+                "ORION_MODEL_SELECTION_PATH",
+                str(database_path.parent / "model-selection.json"),
+            )
+        ).expanduser()
+        selections = ModelSelectionStore(selection_path).read()
+        llm_model_id = os.getenv("ORION_LLM_MODEL_ID") or selections.get(
+            "llm", "qwen3.5-2b-q4"
+        )
+        default_stt_backend = "whisper.cpp" if voice_profile == "wakeword" else "vosk"
+        stt_env_id = os.getenv("ORION_STT_MODEL_ID")
+        explicit_stt_backend = os.getenv("ORION_STT_BACKEND")
+        stt_model_id = stt_env_id or selections.get(
+            "stt",
+            "whisper-base-en"
+            if explicit_stt_backend == "whisper.cpp" or default_stt_backend == "whisper.cpp"
+            else "vosk-en-small",
+        )
+        stt_backend = (
+            get_model(stt_model_id).runtime
+            if stt_env_id or "stt" in selections
+            else (explicit_stt_backend or default_stt_backend).lower()
+        )
+        tts_env_id = os.getenv("ORION_TTS_MODEL_ID")
+        explicit_tts_backend = os.getenv("ORION_TTS_BACKEND")
+        if (
+            explicit_tts_backend == "piper"
+            and not os.getenv("ORION_TTS_MODEL_PATH")
+            and not tts_env_id
+            and "tts" not in selections
+        ):
+            raise ValueError("Piper requires ORION_TTS_MODEL_PATH or ORION_TTS_MODEL_ID")
+        default_tts_id = (
+            "piper-lessac-medium" if explicit_tts_backend == "piper" else "kittentts-nano"
+        )
+        tts_model_id = tts_env_id or selections.get("tts", default_tts_id)
+        tts_backend = (
+            get_model(tts_model_id).runtime
+            if tts_env_id or "tts" in selections
+            else explicit_tts_backend.lower()
+            if explicit_tts_backend
+            else get_model(tts_model_id).runtime
+        )
+        embedding_model_id = os.getenv("ORION_EMBEDDING_MODEL_ID") or selections.get(
+            "embedding", "bge-small-en-v1.5"
+        )
+        wakeword_model_id = os.getenv("ORION_WAKEWORD_MODEL_ID") or selections.get(
+            "wakeword",
+            "hey-jarvis"
+            if voice_profile == "legacy" and wake_word_enabled
+            else "hey-orion",
+        )
+        llm_spec = get_model(llm_model_id)
+        stt_spec = get_model(stt_model_id)
+        tts_spec = get_model(tts_model_id)
+        embedding_spec = get_model(embedding_model_id)
+        wakeword_spec = get_model(wakeword_model_id)
+        if any(spec.kind != expected for spec, expected in (
+            (llm_spec, "llm"), (stt_spec, "stt"), (tts_spec, "tts"),
+            (embedding_spec, "embedding"), (wakeword_spec, "wakeword"),
+        )):
+            raise ValueError("Selected model ID does not match its model role")
         wakeword_profile = voice_profile == "wakeword" or wake_word_enabled
         model_path = os.getenv("ORION_MODEL_PATH")
+        stt_model_path = os.getenv("ORION_STT_MODEL_PATH")
+        vosk_model_path = Path(
+            os.getenv(
+                "ORION_VOSK_MODEL_PATH",
+                stt_model_path or "models/vosk-model-en-us-0.22-lgraph",
+            )
+        ).expanduser()
         audio_device = os.getenv("ORION_AUDIO_DEVICE", "default")
         microphone_mute_pin = os.getenv("ORION_MICROPHONE_MUTE_PIN")
         speaker_mute_pin = os.getenv("ORION_SPEAKER_MUTE_PIN")
 
         settings = cls(
+            model_root=model_root,
+            model_selection_path=selection_path,
+            active_llm_model=llm_model_id,
+            active_stt_model=stt_model_id,
+            active_tts_model=tts_model_id,
+            active_embedding_model=embedding_model_id,
+            active_wakeword_model=wakeword_model_id,
             model_backend=model_backend,
-            model_path=Path(model_path).expanduser() if model_path else None,
+            model_path=(
+                resolve_model_path(model_root, llm_model_id)
+                if os.getenv("ORION_LLM_MODEL_ID") or "llm" in selections
+                else Path(model_path).expanduser()
+                if model_path else resolve_model_path(model_root, llm_model_id)
+            ),
             model_base_url=os.getenv(
                 "ORION_MODEL_BASE_URL",
                 "http://127.0.0.1:8080/v1",
             ),
-            model_context_size=_env_int("MODEL_CONTEXT_SIZE", 4096),
+            model_context_size=_env_int(
+                "MODEL_CONTEXT_SIZE", llm_spec.context_size or 4096
+            ),
             model_template_overhead_tokens=_env_int("MODEL_TEMPLATE_OVERHEAD_TOKENS", 512),
             model_answer_tokens=_env_int("MODEL_ANSWER_TOKENS", 512),
             model_planner_tokens=_env_int("MODEL_PLANNER_TOKENS", 128),
@@ -133,9 +240,7 @@ class Settings:
             max_tool_execution_time=_env_float("MAX_TOOL_EXECUTION_TIME", 15.0),
             max_total_task_time=_env_float("MAX_TOTAL_TASK_TIME", 120.0),
             max_context_tokens=_env_int("MAX_CONTEXT_TOKENS", 3072),
-            database_path=_env_path(
-                "DATABASE_PATH", "~/.local/share/orion/orion.sqlite3"
-            ),
+            database_path=database_path,
             memory_recent_message_limit=_env_int("MEMORY_RECENT_MESSAGE_LIMIT", 16),
             memory_search_limit=_env_int("MEMORY_SEARCH_LIMIT", 5),
             reminder_timezone=os.getenv("ORION_REMINDER_TIMEZONE", "Asia/Kolkata"),
@@ -155,32 +260,46 @@ class Settings:
             stt_threads=_env_int("STT_THREADS", 2),
             stt_timeout=_env_float("STT_TIMEOUT", 30.0),
             whisper_cli_path=os.getenv("ORION_WHISPER_CLI_PATH", "whisper-cli"),
-            tts_backend=os.getenv("ORION_TTS_BACKEND", "kittentts").lower(),
+            tts_backend=tts_backend,
+            tts_threads=_env_int("TTS_THREADS", 2),
+            runtime_idle_timeout=_env_float("RUNTIME_IDLE_TIMEOUT", 60.0),
             tts_model_path=(
                 _env_path("TTS_MODEL_PATH", "")
-                if os.getenv("ORION_TTS_MODEL_PATH") else None
+                if os.getenv("ORION_TTS_MODEL_PATH") and not (
+                    tts_env_id or "tts" in selections
+                )
+                else resolve_model_path(model_root, tts_model_id)
+                if tts_spec.runtime == "piper" else None
             ),
             wake_word_model_path=(
                 _env_path("WAKE_WORD_MODEL_PATH", "")
                 if os.getenv("ORION_WAKE_WORD_MODEL_PATH")
                 else Path("models/hey_jarvis.onnx")
+                if wakeword_profile and wakeword_model_id == "hey-jarvis" and voice_profile == "legacy"
+                else resolve_model_path(model_root, wakeword_model_id)
                 if wakeword_profile else None
             ),
             wake_word_melspectrogram_path=(
                 _env_path("WAKE_WORD_MELSPECTROGRAM_PATH", "")
                 if os.getenv("ORION_WAKE_WORD_MELSPECTROGRAM_PATH")
                 else Path("artifacts/wakeword-staging/melspectrogram.onnx")
+                if wakeword_profile and wakeword_model_id == "hey-jarvis" and voice_profile == "legacy"
+                else model_root / "WAKEWORD" / WAKEWORD_MELSPECTROGRAM_FILENAME
                 if wakeword_profile else None
             ),
             wake_word_embedding_path=(
                 _env_path("WAKE_WORD_EMBEDDING_PATH", "")
                 if os.getenv("ORION_WAKE_WORD_EMBEDDING_PATH")
                 else Path("artifacts/wakeword-staging/embedding_model.onnx")
+                if wakeword_profile and wakeword_model_id == "hey-jarvis" and voice_profile == "legacy"
+                else model_root / "WAKEWORD" / WAKEWORD_EMBEDDING_FILENAME
                 if wakeword_profile else None
             ),
             wake_word_manifest_path=(
                 _env_path("WAKE_WORD_MANIFEST_PATH", "")
                 if os.getenv("ORION_WAKE_WORD_MANIFEST_PATH")
+                else model_root / "WAKEWORD" / WAKEWORD_MANIFEST_FILENAME
+                if wakeword_profile and wakeword_model_id == "hey-orion"
                 else None
             ),
             wake_word_threads=_env_int("WAKE_WORD_THREADS", 1),
@@ -196,13 +315,18 @@ class Settings:
             wake_word=os.getenv("ORION_WAKE_WORD", "hey_jarvis"),
             wake_word_enabled=wake_word_enabled,
             wake_word_threshold=_env_float("WAKE_WORD_THRESHOLD", 0.5),
-            stt_model_path=_env_path(
-                "STT_MODEL_PATH",
-                "/opt/orion/models/whisper/ggml-base.en.bin"
-                if stt_backend == "whisper.cpp"
-                else "models/vosk-model-en-us-0.22-lgraph",
+            stt_model_path=(
+                _env_path("STT_MODEL_PATH", "")
+                if stt_model_path and not (stt_env_id or "stt" in selections)
+                else resolve_model_path(model_root, stt_model_id)
+                if stt_spec.runtime == "whisper.cpp" else vosk_model_path
             ),
-            tts_voice=os.getenv("ORION_TTS_VOICE", "expr-voice-3-f"),
+            vosk_model_path=vosk_model_path,
+            tts_voice=os.getenv(
+                "ORION_TTS_VOICE",
+                Path(tts_spec.filename).stem
+                if tts_spec.runtime == "piper" else "expr-voice-3-f",
+            ),
             tts_sample_rate=_env_int("TTS_SAMPLE_RATE", 24000),
             push_to_talk_pin=_env_int("PUSH_TO_TALK_PIN", 23),
             tts_interrupt_pin=_env_int("TTS_INTERRUPT_PIN", 16),
@@ -223,10 +347,12 @@ class Settings:
             raise ValueError("ORION_VOICE_PROFILE must be 'legacy' or 'wakeword'")
         if self.stt_backend not in {"vosk", "whisper.cpp"}:
             raise ValueError("ORION_STT_BACKEND must be 'vosk' or 'whisper.cpp'")
-        if self.tts_backend != "kittentts":
-            raise ValueError("ORION_TTS_BACKEND currently supports only 'kittentts'; Piper is Phase 15")
-        if self.voice_profile == "legacy" and self.stt_backend != "vosk":
-            raise ValueError("Whisper requires ORION_VOICE_PROFILE=wakeword")
+        if self.tts_backend not in {"kittentts", "piper"}:
+            raise ValueError("ORION_TTS_BACKEND must be 'kittentts' or 'piper'")
+        if self.tts_backend == "piper" and (
+            self.tts_model_path is None or self.tts_model_path.suffix.lower() != ".onnx"
+        ):
+            raise ValueError("Piper requires ORION_TTS_MODEL_PATH to name a local .onnx voice")
         if self.voice_profile == "wakeword" or self.wake_word_enabled:
             if self.voice_profile == "wakeword" and self.audio_sample_rate != 16000:
                 raise ValueError("Wake-word input requires 16000 Hz mono audio")
@@ -314,8 +440,10 @@ class Settings:
             raise ValueError("ORION VAD threshold and pre-roll must be non-negative")
         if not 0 <= self.wake_word_threshold <= 1:
             raise ValueError("ORION_WAKE_WORD_THRESHOLD must be between 0 and 1")
-        if self.tts_sample_rate < 1:
-            raise ValueError("ORION_TTS_SAMPLE_RATE must be positive")
+        if self.tts_sample_rate < 1 or self.tts_threads < 1:
+            raise ValueError("ORION TTS sample rate and thread count must be positive")
+        if not math.isfinite(self.runtime_idle_timeout) or self.runtime_idle_timeout <= 0:
+            raise ValueError("ORION_RUNTIME_IDLE_TIMEOUT must be finite and positive")
         self._validate_local_model_url()
         self._validate_gpio_pins()
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:

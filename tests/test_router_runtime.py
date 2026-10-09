@@ -1,7 +1,9 @@
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -75,6 +77,7 @@ class SSEDecoderTests(unittest.TestCase):
 
     def test_stream_emits_text_usage_and_finish_metadata(self):
         chunks = [bytes([byte]) for byte in (
+            b'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n\n'
             b'data: {"choices":[{"delta":{"reasoning_content":"hidden"}}]}\n\n'
             b'data: {"choices":[{"delta":{"content":"Hello \xe2\x98\x83"},"finish_reason":null}]}\n\n'
             b'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}\n\n'
@@ -100,6 +103,48 @@ class SSEDecoderTests(unittest.TestCase):
         self.assertEqual(completed.kind, "completed")
         self.assertEqual(completed.finish_reason, "stop")
         self.assertTrue(opener.response.closed)
+
+    def test_stream_survives_delay_before_first_sse_chunk(self):
+        class DelayedHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                time.sleep(0.3)
+                events = (
+                    b'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n\n'
+                    b'data: {"choices":[{"delta":{"content":"Ready."}}]}\n\n'
+                    b'data: [DONE]\n\n'
+                )
+                self.wfile.write(f"{len(events):X}\r\n".encode() + events + b"\r\n0\r\n\r\n")
+                self.wfile.flush()
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DelayedHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            transport = LocalJsonTransport()
+            events = list(
+                transport.stream(
+                    f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                    {"messages": []},
+                    timeout=3,
+                    cancel_event=threading.Event(),
+                )
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
+        self.assertEqual([event.text for event in events if event.kind == "text"], ["Ready."])
+        self.assertEqual(events[-1].kind, "completed")
 
     def test_rejects_stream_without_done_marker(self):
         opener = FakeStreamOpener([b'data: {"choices":[]}\n\n'])

@@ -106,20 +106,23 @@ class LocalToolTests(unittest.TestCase):
         runtime.stream.return_value = iter(
             [ModelStreamEvent(kind="completed", finish_reason="stop")]
         )
-        with patch("orion.llm.runtime.LlamaCppServer") as server_type, patch(
-            "orion.llm.runtime.create_local_model", return_value=runtime
-        ) as create_runtime:
-            model = _LazyLocalModel(Settings())
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model.gguf"
+            model_path.touch()
+            with patch("orion.llm.provider.LlamaCppServer") as server_type, patch(
+                "orion.llm.provider.create_local_model", return_value=runtime
+            ) as create_runtime:
+                model = _LazyLocalModel(replace(Settings(), model_path=model_path))
 
-            events = list(
-                model.stream(
-                    [ChatMessage("user", "Hello")],
-                    max_tokens=16,
-                    timeout=1,
-                    cancel_event=threading.Event(),
+                events = list(
+                    model.stream(
+                        [ChatMessage("user", "Hello")],
+                        max_tokens=16,
+                        timeout=1,
+                        cancel_event=threading.Event(),
+                    )
                 )
-            )
-            model.close()
+                model.close()
 
         self.assertEqual(events[0].kind, "completed")
         server_type.return_value.start.assert_called_once()

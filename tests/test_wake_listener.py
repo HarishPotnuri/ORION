@@ -261,7 +261,7 @@ class BackgroundCall:
 
 
 class ListenerHarness:
-    def __init__(self, directory, *, muted=False):
+    def __init__(self, directory, *, muted=False, allow_wakeword_during_speech=False):
         self.settings = replace(
             Settings(), audio_sample_rate=16000, audio_block_frames=320,
             vad_rms_threshold=500, vad_silence_ms=40, vad_preroll_ms=20,
@@ -278,7 +278,9 @@ class ListenerHarness:
         self.source = QueueSource()
         self.detector = MarkerDetector()
         self.transcriber = Transcriber()
-        self.gate = AudioGate()
+        self.gate = AudioGate(
+            allow_wakeword_during_speech=allow_wakeword_during_speech
+        )
         self.stop = threading.Event()
         self.listener = WakeListenerInput(
             self.settings, self.detector, self.transcriber, self.control,
@@ -548,6 +550,33 @@ def test_playback_started_during_capture_suppresses_wake_and_reopens(harness):
     call = harness.request()
     voiced_turn(fresh_session)
     assert call.result() == "recognized words"
+
+
+def test_wakeword_barge_in_interrupts_playback_then_captures_fresh_command(tmp_path):
+    harness = ListenerHarness(tmp_path, allow_wakeword_during_speech=True)
+    try:
+        harness.listener.start()
+        session = harness.source.next_session()
+        with harness.gate.interruptible_turn() as cancellation:
+            with harness.gate.speaking():
+                session.feed(*([pcm(WAKE_AMPLITUDE)] * 8))
+                assert harness.gate.interrupt_event.wait(WAIT)
+                assert cancellation.is_set()
+                assert harness.listener._turn_phase == "capturing"
+                assert harness.transcriber.calls == []
+
+            blocks = [pcm(1000), pcm(1200), pcm(0), pcm(0)]
+            session.feed(*blocks)
+            session.drain()
+
+        assert harness.listener._barge_in_ready.wait(WAIT)
+        assert harness.transcriber.calls == []
+        assert harness.listener.next_utterance() == "recognized words"
+        assert harness.listener.claim_utterance()
+        assert harness.transcriber.calls[0][0] == b"".join(blocks)
+        assert harness.wake_events == ["LISTENING"]
+    finally:
+        harness.close()
 
 
 def test_close_joins_active_capture_and_waiting_consumer(harness):

@@ -1,4 +1,5 @@
 import threading
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -6,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from orion.app import (
+    _LazyLocalModel,
+    _StatusSpeechOutput,
     _confirm_spoken_action,
     _create_audio_input,
     _create_interrupt_button,
@@ -65,6 +68,23 @@ class FakeScheduler:
 
 
 class VoiceServiceTests(unittest.TestCase):
+    def test_idle_model_eviction_waits_for_active_work(self):
+        model = _LazyLocalModel(Settings())
+        server = Mock()
+        model._runtime = object()
+        model._server = server
+
+        with model._using_runtime():
+            model._last_used -= 61
+            self.assertFalse(model.evict_if_idle(60))
+            server.stop.assert_not_called()
+
+        model._last_used -= 61
+        self.assertTrue(model.evict_if_idle(60))
+        server.stop.assert_called_once()
+        self.assertIsNone(model._runtime)
+        self.assertIsNone(model._server)
+
     def test_led_status_maps_to_distinct_rgb_colors(self):
         class FakeLED:
             color = None
@@ -170,7 +190,7 @@ class VoiceServiceTests(unittest.TestCase):
             self.assertEqual(main(["--run-voice"]), 0)
         run_service.assert_called_once()
 
-    def test_push_to_talk_warms_stt_before_announcing_readiness(self):
+    def test_push_to_talk_defers_stt_initialization_until_first_utterance(self):
         events = []
         button = FakeButton()
 
@@ -197,9 +217,9 @@ class VoiceServiceTests(unittest.TestCase):
 
         self.assertIsInstance(audio_input, AudioInput)
         self.assertIs(actual_button, button)
-        self.assertEqual(events, ["warmup", "Press GPIO 23 to speak"])
+        self.assertEqual(events, ["Press GPIO 23 to speak"])
 
-    def test_push_to_talk_closes_button_when_stt_warmup_fails(self):
+    def test_push_to_talk_startup_does_not_warm_or_close_button(self):
         button = FakeButton()
 
         class AudioInput:
@@ -213,14 +233,15 @@ class VoiceServiceTests(unittest.TestCase):
             patch.dict("sys.modules", {"gpiozero": SimpleNamespace(Button=lambda _pin: button)}),
             patch("orion.app.PushToTalkInput", AudioInput),
         ):
-            with self.assertRaisesRegex(RuntimeError, "model load failed"):
-                _create_audio_input(
-                    replace(Settings(), voice_profile="legacy", stt_backend="vosk"),
-                    AudioGate(),
-                    threading.Event(),
-                )
+            audio_input, actual_button = _create_audio_input(
+                replace(Settings(), voice_profile="legacy", stt_backend="vosk"),
+                AudioGate(),
+                threading.Event(),
+            )
 
-        self.assertTrue(button.closed)
+        self.assertIsInstance(audio_input, AudioInput)
+        self.assertIs(actual_button, button)
+        self.assertFalse(button.closed)
 
     def test_legacy_wake_word_never_constructs_downloadable_builtin_model(self):
         settings = replace(
@@ -452,6 +473,161 @@ class VoiceServiceTests(unittest.TestCase):
         self.assertNotIn("What time is it?", joined_logs)
         self.assertNotIn("Remind me tomorrow", joined_logs)
 
+    def test_streamed_voice_speaks_first_phrase_before_generation_finishes(self):
+        stop_event = threading.Event()
+        scheduler = FakeScheduler()
+        gate = AudioGate()
+        spoken = []
+        stream_completed = []
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Explain the result"
+                stop_event.set()
+                return ""
+
+        class Orchestrator:
+            def stream(self, _request, *, cancel_event):
+                if not gate.is_open:
+                    raise AssertionError("planner must retain confirmation input before speech")
+                yield SimpleNamespace(kind="text", text="First sentence. ")
+                self.assertions()
+                if gate.is_open:
+                    raise AssertionError("capture gate must stay closed during phrase gaps")
+                yield SimpleNamespace(kind="text", text="The value is 3.14.")
+                stream_completed.append(True)
+                yield SimpleNamespace(kind="completed")
+
+            @staticmethod
+            def assertions():
+                if spoken != ["First sentence."]:
+                    raise AssertionError("speech waited for generation completion")
+
+        class Adapter:
+            def speak(self, text):
+                spoken.append(text)
+
+        _run_voice_loop(
+            AudioInput(), Orchestrator(),
+            _StatusSpeechOutput(Adapter(), lambda _status: None, gate), scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(spoken, ["First sentence.", "The value is 3.14."])
+        self.assertEqual(stream_completed, [True])
+        self.assertTrue(scheduler.stopped)
+
+    def test_gpio_interrupt_discards_unsaid_stream_tail(self):
+        stop_event = threading.Event()
+        scheduler = FakeScheduler()
+        gate = AudioGate()
+        spoken = []
+        cancellations = []
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Tell me something"
+                stop_event.set()
+                return ""
+
+        class Orchestrator:
+            def stream(self, _request, *, cancel_event):
+                yield SimpleNamespace(kind="text", text="First. Unsaid tail")
+                cancellations.append(cancel_event.is_set())
+                yield SimpleNamespace(kind="completed")
+
+        class Adapter:
+            def speak(self, text):
+                spoken.append(text)
+                gate.request_interrupt()
+
+        output = _StatusSpeechOutput(Adapter(), lambda _status: None, gate)
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), output, scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(spoken, ["First."])
+        self.assertEqual(cancellations, [True])
+        self.assertTrue(gate.is_open)
+
+    def test_gpio_interrupt_cancels_generation_before_first_phrase(self):
+        stop_event = threading.Event()
+        scheduler = FakeScheduler()
+        gate = AudioGate()
+        cancellations = []
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Explain this"
+                stop_event.set()
+                return ""
+
+        class Orchestrator:
+            def stream(self, _request, *, cancel_event):
+                if not gate.is_open:
+                    raise AssertionError("generation must not suppress confirmation capture")
+                gate.request_interrupt()
+                cancellations.append(cancel_event.is_set())
+                yield SimpleNamespace(kind="text", text="Must not be spoken.")
+
+        class Adapter:
+            def speak(self, _text):
+                raise AssertionError("interrupted output must be discarded")
+
+        output = _StatusSpeechOutput(Adapter(), lambda _status: None, gate)
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), output, scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(cancellations, [True])
+        self.assertTrue(gate.is_open)
+
+    def test_playback_session_serializes_reminder_and_keeps_capture_suppressed(self):
+        gate = AudioGate()
+        spoken = []
+        reminder_started = threading.Event()
+        reminder_finished = threading.Event()
+
+        class Adapter:
+            def speak(self, text):
+                spoken.append(text)
+
+        output = _StatusSpeechOutput(Adapter(), lambda _status: None, gate)
+
+        def speak_reminder():
+            reminder_started.set()
+            output.speak("Reminder")
+            reminder_finished.set()
+
+        with output.session():
+            output.speak("First phrase")
+            self.assertFalse(gate.is_open)
+            reminder = threading.Thread(target=speak_reminder)
+            reminder.start()
+            self.assertTrue(reminder_started.wait(1))
+            self.assertFalse(reminder_finished.wait(0.02))
+            output.speak("Second phrase")
+            self.assertFalse(gate.is_open)
+
+        reminder.join(1)
+        self.assertTrue(reminder_finished.is_set())
+        self.assertTrue(gate.is_open)
+        self.assertEqual(spoken, ["First phrase", "Second phrase", "Reminder"])
+
     def test_voice_loop_speaks_short_error_after_turn_failure(self):
         stop_event = threading.Event()
         spoken = []
@@ -593,6 +769,39 @@ class VoiceServiceTests(unittest.TestCase):
                 )
 
         self.assertTrue(button.closed)
+
+    def test_incomplete_orion_and_jarvis_assets_fall_back_to_vosk_ptt(self):
+        from orion.app import _create_audio_input
+
+        with tempfile.TemporaryDirectory() as directory:
+            vosk_directory = Path(directory) / "vosk-model"
+            vosk_directory.mkdir()
+            button = FakeButton()
+            wake_settings = replace(
+                Settings(),
+                model_root=Path(directory) / "depot",
+                voice_profile="wakeword",
+                stt_backend="whisper.cpp",
+                active_wakeword_model="hey-orion",
+                vosk_model_path=vosk_directory,
+                stt_model_path=Path(directory) / "whisper.bin",
+            )
+            with (
+                patch.dict("sys.modules", {"gpiozero": SimpleNamespace(Button=lambda *_args, **_kwargs: button)}),
+                patch(
+                    "orion.app.OpenWakeWordDetector.from_settings",
+                    side_effect=FileNotFoundError("classifier missing"),
+                ) as detector_factory,
+                patch("orion.app.logger.warning") as warning,
+            ):
+                audio_input, actual_button = _create_audio_input(
+                    wake_settings, AudioGate(), threading.Event()
+                )
+
+        self.assertIsInstance(audio_input, PushToTalkInput)
+        self.assertIs(actual_button, button)
+        self.assertEqual(detector_factory.call_count, 2)
+        self.assertTrue(any("legacy VOSK/PTT" in str(call) for call in warning.call_args_list))
 
     def test_wake_profile_closes_control_store_if_transcriber_creation_fails(self):
         control = SimpleNamespace(closed=False)

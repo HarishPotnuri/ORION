@@ -1,6 +1,6 @@
 # Outstanding Issues
 
-Last reviewed: 2026-10-06
+Last reviewed: 2026-10-08
 
 This document tracks known open issues and unverified acceptance gates. A passing unit test or a successful isolated component check is not evidence that the complete voice service is reliable on the Raspberry Pi. Do not mark an item resolved until its closure criteria are met and the result is recorded here and, where appropriate, in `Plan.md`.
 
@@ -156,6 +156,22 @@ The deployed source logs PTT wait, VAD/end-of-speech, STT, orchestration, planne
 A single typed inference, an isolated TTS run, or the 12-cycle interruption stress test is not a sustained-performance benchmark. Multi-turn voice is user-confirmed working; continue supervised workload soaks to establish the reliability gate.
 
 **Close when:** Repeated interactions remain bounded and stable under documented conditions, memory/thermal headroom meet an explicit budget, and all advertised performance claims are tied to those measurements.
+
+## P2: Phase 15 Model Depot, Piper, and Streamed Voice Acceptance
+
+**Status:** Implemented and regression-tested locally; not deployed or Pi-verified. Legacy/VOSK and KittenTTS remain the supported staging profile.
+
+**Evidence:** Local coverage verifies model ID/path resolution, persistent selection, one-model LLM load/unload/switch, stable offline inventory, sequential benchmark JSON, selectable Whisper PTT, lazy Piper asset loading, metadata-rate chunk playback, streamed first-phrase delivery, GPIO16 cancellation, reminder serialization, idle eviction, and Hey Orion/Jarvis-to-VOSK startup fallback. A trained Hey Orion classifier bundle and feature graphs now exist locally; ONNX structural and zero-input CPU inference checks pass. Deployment sync now includes the Hey Orion bundle and sets `ORION_WAKEWORD_MODEL_ID=hey-orion`, while leaving capture on legacy/VOSK. The generated provenance manifest, full evaluation report, license review, and Pi acoustic acceptance remain outstanding. Piper package/voice licenses remain unreviewed. BGE inference is an optional provider boundary only; semantic retrieval remains unchanged.
+
+**Next actions:**
+
+1. Add the training-produced provenance manifest and evaluation report to the approved bundle. Record source, revision, SHA-256, and license; keep VOSK separately provisioned for rollback.
+2. Deploy and validate the Hey Orion classifier and feature assets. Preserve legacy/VOSK and verify rollback before enabling wake capture.
+3. Run `orion-model validate` for each selected model, then benchmark candidate GGUFs sequentially under identical Pi conditions.
+4. Test offline cold start, first phrase timing, GPIO16 interruption, wakeword barge-in, command capture after playback stops, speaker leakage/false wake activation, reminder serialization/retry, idle eviction, shutdown, reboot, and a 30-minute soak on the Pi.
+5. Record memory, CPU, temperature, throttling, swap, and latency. Do not promote the candidate based on local tests.
+
+**Close when:** The provisioned profile passes the documented clean-install and Pi gates, license/provenance records exist, and rollback preserves user data and the legacy profile.
 
 ## P3: Conservative Hybrid Routing Coverage
 

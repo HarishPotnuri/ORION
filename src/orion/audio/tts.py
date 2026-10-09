@@ -8,7 +8,8 @@ import threading
 import queue
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -239,3 +240,158 @@ class KittenSpeechOutput:
         waiter.join()
         if not errors.empty():
             raise errors.get_nowait()
+
+
+class PiperSpeechOutput:
+    def __init__(
+        self,
+        settings: Settings,
+        gate: AudioGate,
+        *,
+        voice_factory: Callable | None = None,
+        output_stream_factory: Callable | None = None,
+    ):
+        self.settings = settings
+        self.gate = gate
+        self._voice_factory = voice_factory
+        self._output_stream_factory = output_stream_factory
+        self._voice: Any = None
+        self._lock = threading.Lock()
+        self._last_used = time.monotonic()
+
+    def _load_voice(self):
+        if self._voice is not None:
+            return self._voice
+        model_path = self.settings.tts_model_path
+        if model_path is None:
+            raise ValueError("Piper requires a local ORION_TTS_MODEL_PATH")
+        model_path = model_path.expanduser().resolve()
+        config_path = Path(f"{model_path}.json")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Piper voice config not found: {config_path}")
+
+        factory = self._voice_factory or self._create_voice
+        self._voice = factory(
+            model_path=model_path,
+            config_path=config_path,
+            threads=self.settings.tts_threads,
+        )
+        return self._voice
+
+    @staticmethod
+    def _create_voice(*, model_path: Path, config_path: Path, threads: int):
+        try:
+            import onnxruntime
+            from piper import PiperVoice
+            from piper.config import PiperConfig
+        except ImportError as error:
+            raise RuntimeError("piper-tts and onnxruntime are required for Piper speech") from error
+
+        with config_path.open(encoding="utf-8") as config_file:
+            config = PiperConfig.from_dict(json.load(config_file))
+        session_options = onnxruntime.SessionOptions()
+        session_options.intra_op_num_threads = threads
+        session_options.inter_op_num_threads = 1
+        session = onnxruntime.InferenceSession(
+            str(model_path),
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+        return PiperVoice(session, config)
+
+    def speak(self, text: str) -> None:
+        if not text.strip():
+            return
+        with self._lock, self.gate.speaking():
+            voice = self._load_voice()
+            source_rate = int(voice.config.sample_rate)
+            if source_rate < 1:
+                raise ValueError("Piper voice metadata has an invalid sample rate")
+            self._play_chunks(self._audio_chunks(voice, text, source_rate), source_rate)
+            self._last_used = time.monotonic()
+
+    def _audio_chunks(self, voice, text: str, source_rate: int) -> Iterator[tuple[array.array, int]]:
+        for chunk in voice.synthesize(text):
+            if self.gate.wait_for_interrupt(0):
+                return
+            rate = int(getattr(chunk, "sample_rate", source_rate))
+            samples = array.array("h")
+            samples.frombytes(chunk.audio_int16_bytes)
+            yield samples, rate
+
+    def _play_chunks(self, chunks: Iterator[tuple[array.array, int]], source_rate: int) -> None:
+        try:
+            import sounddevice as sd
+        except ImportError as error:
+            raise RuntimeError("sounddevice is required for local speech playback") from error
+
+        target_rate = self.settings.tts_sample_rate
+        try:
+            sd.check_output_settings(
+                device=self.settings.audio_device,
+                channels=1,
+                dtype="float32",
+                samplerate=target_rate,
+            )
+        except sd.PortAudioError:
+            device_info = sd.query_devices(self.settings.audio_device, "output")
+            target_rate = int(round(device_info["default_samplerate"]))
+            sd.check_output_settings(
+                device=self.settings.audio_device,
+                channels=1,
+                dtype="float32",
+                samplerate=target_rate,
+            )
+
+        first_chunk = next(chunks, None)
+        if first_chunk is None:
+            return
+        stream_factory = self._output_stream_factory or sd.RawOutputStream
+        stream_options = {
+            "samplerate": target_rate,
+            "device": self.settings.audio_device,
+            "channels": 1,
+            "dtype": "float32",
+        }
+        block_samples = max(1, target_rate // 50)
+        interrupted = False
+        with stream_factory(**stream_options) as stream:
+            for samples, chunk_rate in chain((first_chunk,), chunks):
+                if self.gate.wait_for_interrupt(0):
+                    interrupted = True
+                    break
+                normalized = [sample / 32768.0 for sample in samples]
+                converted = KittenSpeechOutput._resample(
+                    normalized, chunk_rate or source_rate, target_rate
+                )
+                for start in range(0, len(converted), block_samples):
+                    if self.gate.wait_for_interrupt(0):
+                        interrupted = True
+                        break
+                    block = array.array("f", converted[start:start + block_samples])
+                    stream.write(block.tobytes())
+                    if self.gate.wait_for_interrupt(0):
+                        interrupted = True
+                        break
+                if interrupted:
+                    break
+            if interrupted:
+                stream.abort()
+        logger.info(
+            "Piper playback outcome=%s",
+            "interrupted" if interrupted else "completed",
+        )
+
+    def evict_if_idle(self, timeout: float) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._voice is None or time.monotonic() - self._last_used < timeout:
+                return False
+            self._voice = None
+            logger.info("Evicted idle Piper voice")
+            return True
+        finally:
+            self._lock.release()

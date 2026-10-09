@@ -9,7 +9,10 @@ import signal
 import sys
 import time
 from collections.abc import Iterator, Sequence
-from threading import Event
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import replace
+from threading import Event, RLock, Thread
+from pathlib import Path
 
 from .config import Settings
 from .logging_config import configure_logging
@@ -17,12 +20,18 @@ from .audio.capture import AudioGate
 from .audio.control import MicrophoneControl
 from .audio.factory import create_speech_output, create_transcriber
 from .audio.listener import WakeListenerInput
-from .audio.stt import PushToTalkInput, WakeWordInput
-from .audio.tts import KittenSpeechOutput
+from .audio.stt import PushToTalkInput, WakeWordInput, WhisperPushToTalkInput
+from .audio.streaming import SpeechPhraseBuffer
 from .audio.wakeword import OpenWakeWordDetector, validate_settings as validate_wakeword_settings
 from .core.router import OrionRouter
 from .core.orchestrator import RequestOrchestrator
+from .llm.provider import LlamaCppProvider
 from .memory.manager import MemoryManager
+from .models import (
+    WAKEWORD_EMBEDDING_FILENAME,
+    WAKEWORD_MELSPECTROGRAM_FILENAME,
+    resolve_model_path,
+)
 from .reminders.manager import ReminderManager
 from .reminders.scheduler import ReminderNotifier, ReminderScheduler
 from .tools.factory import create_default_tools
@@ -31,19 +40,53 @@ logger = logging.getLogger(__name__)
 
 
 class _StatusSpeechOutput:
-    def __init__(self, speech_output, set_status):
+    def __init__(self, speech_output, set_status, gate: AudioGate | None = None):
         self.speech_output = speech_output
         self.set_status = set_status
+        self.gate = gate
+        self._lock = RLock()
+        self._session_depth = 0
 
     def warmup(self) -> None:
         self.speech_output.warmup()
 
     def speak(self, text: str) -> None:
-        self.set_status("SPEAKING")
-        try:
-            self.speech_output.speak(text)
-        finally:
-            self.set_status("IDLE")
+        with self._lock:
+            outer_call = self._session_depth == 0
+            self.set_status("SPEAKING")
+            try:
+                self.speech_output.speak(text)
+            finally:
+                if outer_call:
+                    self.set_status("IDLE")
+
+    @contextmanager
+    def session(self):
+        gate_context = self.gate.speaking() if self.gate is not None else nullcontext()
+        with self._lock, gate_context:
+            self._session_depth += 1
+            try:
+                yield self
+            finally:
+                self._session_depth -= 1
+                if self._session_depth == 0:
+                    self.set_status("IDLE")
+
+    @property
+    def interrupt_event(self):
+        return self.gate.interrupt_event if self.gate is not None else None
+
+    @contextmanager
+    def turn(self):
+        if self.gate is None:
+            yield Event()
+            return
+        with self.gate.interruptible_turn() as cancellation:
+            yield cancellation
+
+    def evict_if_idle(self, timeout: float) -> bool:
+        evict = getattr(self.speech_output, "evict_if_idle", None)
+        return bool(evict and evict(timeout))
 
 
 class _VoiceStatusLED:
@@ -189,7 +232,60 @@ def _create_audio_input(
         raise RuntimeError("gpiozero is required for voice input") from error
 
     if settings.voice_profile == "wakeword" or settings.wake_word_enabled:
-        detector = OpenWakeWordDetector.from_settings(settings)
+        try:
+            detector = OpenWakeWordDetector.from_settings(settings)
+        except FileNotFoundError as hey_orion_error:
+            if (
+                settings.active_wakeword_model != "hey-orion"
+                or (settings.voice_profile == "legacy" and settings.wake_word_enabled)
+            ):
+                raise
+            jarvis_model = resolve_model_path(settings.model_root, "hey-jarvis")
+            if not jarvis_model.is_file():
+                jarvis_model = Path("models/hey_jarvis.onnx")
+            mel_path = settings.model_root / "WAKEWORD" / WAKEWORD_MELSPECTROGRAM_FILENAME
+            embedding_path = settings.model_root / "WAKEWORD" / WAKEWORD_EMBEDDING_FILENAME
+            if not mel_path.is_file():
+                mel_path = Path("artifacts/wakeword-staging/melspectrogram.onnx")
+            if not embedding_path.is_file():
+                embedding_path = Path("artifacts/wakeword-staging/embedding_model.onnx")
+            jarvis_settings = replace(
+                settings,
+                active_wakeword_model="hey-jarvis",
+                wake_word="hey_jarvis",
+                wake_word_model_path=jarvis_model,
+                wake_word_melspectrogram_path=mel_path,
+                wake_word_embedding_path=embedding_path,
+                wake_word_manifest_path=None,
+            )
+            try:
+                detector = OpenWakeWordDetector.from_settings(jarvis_settings)
+                settings = jarvis_settings
+                logger.warning("Hey Orion assets unavailable; using Hey Jarvis staging model")
+            except FileNotFoundError as jarvis_error:
+                fallback = replace(
+                    settings,
+                    voice_profile="legacy",
+                    wake_word_enabled=False,
+                    stt_backend="vosk",
+                    active_stt_model="vosk-en-small",
+                    stt_model_path=settings.vosk_model_path,
+                )
+                if not fallback.vosk_model_path.expanduser().is_dir():
+                    raise RuntimeError(
+                        "Hey Orion and Hey Jarvis assets are incomplete; "
+                        f"legacy VOSK model is unavailable: {fallback.vosk_model_path}"
+                    ) from jarvis_error
+                gate.allow_wakeword_during_speech = False
+                logger.warning(
+                    "Wakeword assets incomplete (Hey Orion: %s; Hey Jarvis: %s); "
+                    "starting legacy VOSK/PTT",
+                    hey_orion_error,
+                    jarvis_error,
+                )
+                return _create_audio_input(
+                    fallback, gate, stop_event, set_status, set_microphone_muted
+                )
         control = MicrophoneControl(settings.database_path.expanduser())
         transcriber = None
         audio_input = None
@@ -247,12 +343,13 @@ def _create_audio_input(
         )
         return audio_input, button
     button = Button(settings.push_to_talk_pin)
-    audio_input = PushToTalkInput(settings, button, gate=gate, stop_event=stop_event)
-    try:
-        audio_input.warmup()
-    except Exception:
-        button.close()
-        raise
+    if settings.stt_backend == "whisper.cpp":
+        transcriber = create_transcriber(settings)
+        audio_input = WhisperPushToTalkInput(
+            settings, button, transcriber, gate=gate, stop_event=stop_event
+        )
+    else:
+        audio_input = PushToTalkInput(settings, button, gate=gate, stop_event=stop_event)
     logger.info("Press GPIO %d to speak", settings.push_to_talk_pin)
     return audio_input, button
 
@@ -275,11 +372,13 @@ def _create_interrupt_button(settings: Settings, gate: AudioGate, push_to_talk_b
 
 
 def _run_voice_check(settings: Settings) -> None:
-    gate = AudioGate()
+    gate = AudioGate(
+        allow_wakeword_during_speech=(
+            settings.voice_profile == "wakeword" or settings.wake_word_enabled
+        )
+    )
     stop_event = Event()
     speech_output = create_speech_output(settings, gate)
-    if settings.voice_profile == "legacy":
-        speech_output.warmup()
     audio_input, button = _create_audio_input(settings, gate, stop_event)
     try:
         transcript = audio_input.next_utterance()
@@ -306,6 +405,7 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
             turn_number += 1
             stage_name = "input"
             stage_started = time.monotonic()
+            spoken = False
             try:
                 set_status(
                     "IDLE"
@@ -332,25 +432,97 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                 set_status("PROCESSING")
                 stage_name = "orchestration"
                 stage_started = time.monotonic()
-                result = orchestrator.handle(transcript)
-                if stop_event.is_set():
-                    break
-                logger.info(
-                    "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=%s completed=%s",
-                    turn_number,
-                    (time.monotonic() - stage_started) * 1000,
-                    result.route.kind.value,
-                    result.completed,
-                )
-                set_status("SPEAKING")
-                stage_name = "tts"
-                stage_started = time.monotonic()
-                speech_output.speak(result.response)
-                logger.info(
-                    "Voice stage=tts turn=%d elapsed_ms=%.1f outcome=returned",
-                    turn_number,
-                    (time.monotonic() - stage_started) * 1000,
-                )
+                stream_response = getattr(orchestrator, "stream", None)
+                if stream_response is None:
+                    result = orchestrator.handle(transcript)
+                    if stop_event.is_set():
+                        break
+                    logger.info(
+                        "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=%s completed=%s",
+                        turn_number,
+                        (time.monotonic() - stage_started) * 1000,
+                        result.route.kind.value,
+                        result.completed,
+                    )
+                    set_status("SPEAKING")
+                    stage_name = "tts"
+                    stage_started = time.monotonic()
+                    speech_output.speak(result.response)
+                    logger.info(
+                        "Voice stage=tts turn=%d elapsed_ms=%.1f outcome=returned",
+                        turn_number,
+                        (time.monotonic() - stage_started) * 1000,
+                    )
+                else:
+                    phrase_buffer = SpeechPhraseBuffer()
+                    spoken = False
+                    completed = False
+                    failed = False
+                    interrupted = False
+                    session = getattr(speech_output, "session", None)
+                    turn = getattr(speech_output, "turn", None)
+                    with ExitStack() as active_turn:
+                        cancellation = (
+                            active_turn.enter_context(turn())
+                            if turn is not None else Event()
+                        )
+                        session_started = False
+                        stream = iter(stream_response(transcript, cancel_event=cancellation))
+                        try:
+                            for event in stream:
+                                if stop_event.is_set() or cancellation.is_set():
+                                    break
+                                if event.kind == "text":
+                                    phrases = phrase_buffer.feed(event.text)
+                                    if phrases:
+                                        stage_name = "tts"
+                                        if session is not None and not session_started:
+                                            active_turn.enter_context(session())
+                                            session_started = True
+                                        for phrase in phrases:
+                                            if stop_event.is_set() or cancellation.is_set():
+                                                break
+                                            spoken = True
+                                            speech_output.speak(phrase)
+                                elif event.kind == "completed":
+                                    completed = True
+                                elif event.kind == "failed":
+                                    failed = True
+                                    break
+                        finally:
+                            close_stream = getattr(stream, "close", None)
+                            if close_stream is not None:
+                                close_stream()
+                        if not stop_event.is_set() and not cancellation.is_set():
+                            tail_phrases = phrase_buffer.feed("", final=True)
+                            if tail_phrases and session is not None and not session_started:
+                                active_turn.enter_context(session())
+                                session_started = True
+                            for phrase in tail_phrases:
+                                spoken = True
+                                speech_output.speak(phrase)
+                        interrupted = cancellation.is_set()
+                    if stop_event.is_set():
+                        break
+                    if failed:
+                        logger.warning("Voice stream failed completed=%s", completed)
+                    if failed and not spoken and not interrupted:
+                        speech_output.speak(
+                            "I couldn't process that turn. Please try again."
+                        )
+                        spoken = True
+                    logger.info(
+                        "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=stream completed=%s failed=%s",
+                        turn_number,
+                        (time.monotonic() - stage_started) * 1000,
+                        completed,
+                        failed,
+                    )
+                    logger.info(
+                        "Voice stage=tts turn=%d outcome=%s",
+                        turn_number,
+                        "streamed" if spoken else "no_output",
+                    )
             except Exception as error:
                 logger.warning(
                     "Voice turn failed turn=%d stage=%s elapsed_ms=%.1f (%s)",
@@ -360,7 +532,7 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     type(error).__name__,
                 )
                 set_status("ERROR")
-                if not stop_event.is_set():
+                if not stop_event.is_set() and not spoken:
                     try:
                         speech_output.speak(
                             "I couldn't process that turn. Please try again."
@@ -380,6 +552,18 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
             set_status("IDLE")
 
 
+def _idle_resource_monitor(stop_event: Event, resources, timeout: float) -> None:
+    interval = min(1.0, max(0.1, timeout / 4))
+    while not stop_event.wait(interval):
+        for resource in resources:
+            evict = getattr(resource, "evict_if_idle", None)
+            if evict is not None:
+                try:
+                    evict(timeout)
+                except Exception as error:
+                    logger.warning("Idle resource eviction failed (%s)", type(error).__name__)
+
+
 def _run_voice_service(settings: Settings) -> None:
     try:
         from gpiozero import RGBLED
@@ -389,11 +573,15 @@ def _run_voice_service(settings: Settings) -> None:
     stop_event = Event()
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigterm = signal.getsignal(signal.SIGTERM)
-    gate = AudioGate()
+    gate = AudioGate(
+        allow_wakeword_during_speech=(
+            settings.voice_profile == "wakeword" or settings.wake_word_enabled
+        )
+    )
     led = None
     voice_status = _VoiceStatusLED()
     audio_input = button = interrupt_button = None
-    model = memory = reminders = scheduler = speech_output = None
+    model = memory = reminders = scheduler = speech_output = idle_thread = None
 
     def set_status(status: str) -> None:
         voice_status.set_status(status)
@@ -412,10 +600,15 @@ def _run_voice_service(settings: Settings) -> None:
         memory = MemoryManager.from_settings(settings)
         reminders = ReminderManager.from_settings(settings)
         speech_output = _StatusSpeechOutput(
-            create_speech_output(settings, gate), set_status
+            create_speech_output(settings, gate), set_status, gate
         )
-        if settings.voice_profile == "legacy":
-            speech_output.warmup()
+        idle_thread = Thread(
+            target=_idle_resource_monitor,
+            args=(stop_event, (model, speech_output), settings.runtime_idle_timeout),
+            name="orion-idle-resource-monitor",
+            daemon=True,
+        )
+        idle_thread.start()
         scheduler = ReminderScheduler(
             reminders.store,
             ReminderNotifier(speak, set_status),
@@ -453,6 +646,8 @@ def _run_voice_service(settings: Settings) -> None:
         )
     finally:
         stop_event.set()
+        if idle_thread is not None:
+            idle_thread.join(timeout=2.0)
         if audio_input is not None:
             audio_input.stop_event.set()
         cleanup_actions = (
@@ -489,7 +684,15 @@ def _run_reminder_service(settings: Settings) -> None:
 
     led = PWMLED(settings.status_led_pin)
     manager = ReminderManager.from_settings(settings)
-    speech_output = create_speech_output(settings, AudioGate())
+    gate = AudioGate()
+    speech_output = create_speech_output(settings, gate)
+    stop_event = Event()
+    idle_thread = Thread(
+        target=_idle_resource_monitor,
+        args=(stop_event, (speech_output,), settings.runtime_idle_timeout),
+        name="orion-reminder-idle-monitor",
+        daemon=True,
+    )
 
     def set_status(status: str) -> None:
         if status == "SPEAKING":
@@ -503,6 +706,7 @@ def _run_reminder_service(settings: Settings) -> None:
         poll_interval=settings.reminder_poll_interval,
     )
     try:
+        idle_thread.start()
         scheduler.start()
         logger.info("Reminder scheduler started")
         while True:
@@ -510,43 +714,16 @@ def _run_reminder_service(settings: Settings) -> None:
     except KeyboardInterrupt:
         logger.info("Stopping reminder scheduler")
     finally:
+        stop_event.set()
+        gate.request_interrupt()
+        idle_thread.join(timeout=2.0)
         scheduler.stop()
         manager.close()
         led.close()
 
 
-class _LazyLocalModel:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self._runtime = None
-        self._server = None
-
-    def complete(self, messages, *, max_tokens: int, timeout: float) -> str:
-        runtime = self._get_runtime()
-        return runtime.complete(messages, max_tokens=max_tokens, timeout=timeout)
-
-    def stream(self, messages, *, max_tokens, timeout, cancel_event) -> Iterator:
-        runtime = self._get_runtime()
-        yield from runtime.stream(
-            messages,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            cancel_event=cancel_event,
-        )
-
-    def _get_runtime(self):
-        if self._runtime is None:
-            from .llm.runtime import LlamaCppServer, create_local_model
-
-            self._server = LlamaCppServer(self.settings)
-            self._server.start()
-            self._runtime = create_local_model(self.settings)
-        return self._runtime
-
-    def close(self) -> None:
-        if self._server is not None:
-            self._server.stop()
-            self._server = None
+class _LazyLocalModel(LlamaCppProvider):
+    """Keep the historical application name for the provider-backed adapter."""
 
 
 def _run_request(settings: Settings, request: str) -> None:

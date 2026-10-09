@@ -2,7 +2,7 @@
 
 End-to-end setup for a new Windows development machine and a freshly imaged Raspberry Pi 5 8 GB. Commands are for the repository state dated 2026-10-07. Read this file from top to bottom for a first install.
 
-Phase 14 is implemented, deployed, and validated on the Pi. This guide also documents how to rebuild the environment from scratch; remaining Phase 16 acceptance gates do not change the deployed model status. Never copy model files into the repository.
+Phase 14 is implemented, deployed, and validated on the Pi. The accepted operational GGUF on Pi and in `ORION-MODELS` has the fingerprint listed below. It differs from the upstream immutable-revision artifact fingerprint recorded in `docs/phase14-artifacts.md`; deployment pins the accepted Pi/depot copy. Never copy model files into the repository.
 
 ## 1. Target And Pins
 
@@ -14,13 +14,14 @@ Phase 14 is implemented, deployed, and validated on the Pi. This guide also docu
 | Python dependency lock | `uv.lock`, always use `uv sync --locked` |
 | Current Pi voice STT profile | VOSK small English `0.15` |
 | LLM model | Post-trained `Qwen/Qwen3.5-2B`, GGUF `Q4_K_M` |
-| GGUF file | `Qwen3.5-2B-Q4_K_M.gguf`, 1,280,835,840 bytes |
-| GGUF SHA-256 | `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223` |
+| Accepted Pi/depot GGUF | `Qwen3.5-2B-Q4_K_M.gguf`, 1,312,165,056 bytes |
+| Accepted Pi/depot SHA-256 | `a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b` |
 | GGUF repository revision | `unsloth/Qwen3.5-2B-GGUF`, `f6d5376be1edb4d416d56da11e5397a961aca8ae` |
 | llama.cpp source commit | `d81235049384534c167caea52b85a694f6103d14` (`v0.6.0`) |
 | Context | 4096 total, 3072 input, up to 512 answer, 512 template/safety reserve |
 | Planner output | 128 tokens |
-| Pi model path | `/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf` |
+| Pi model root | `/opt/orion/models` |
+| Pi model path | `/opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf` |
 | Pi server path | `/usr/local/bin/llama-server` |
 | Pi endpoint | `http://127.0.0.1:8080/v1`, loopback only |
 | Pi state database | `/var/lib/orion/orion.sqlite3` |
@@ -80,21 +81,20 @@ Run the repository's local test and CLI checks with:
 
 This creates a temporary database and removes it after completion.
 
-### Download and verify the Qwen model
+### Use adjacent offline model depot
 
-Keep artifacts in `%LOCALAPPDATA%\ORION\models`, not under the Git checkout.
+Keep `ORION-MODELS` adjacent to the `ORION` checkout, not inside the Git repository. The application maps its supplied uppercase directories directly. Set the root explicitly when it is not adjacent:
 
 ```powershell
-$ModelDirectory = Join-Path $env:LOCALAPPDATA 'ORION\models'
-New-Item -ItemType Directory -Path $ModelDirectory -Force | Out-Null
-$ModelFile = Join-Path $ModelDirectory 'Qwen3.5-2B-Q4_K_M.gguf'
-$ModelUrl = 'https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf?download=true'
-curl.exe --fail --location --retry 5 --retry-all-errors --continue-at - --output $ModelFile $ModelUrl
-$ModelItem = Get-Item $ModelFile
+$ModelRoot = Join-Path (Split-Path -Parent (Get-Location).Path) 'ORION-MODELS'
+if (-not (Test-Path (Join-Path $ModelRoot 'LLM\Qwen3.5-2B-Q4_K_M.gguf'))) { throw "Q4 model missing under $ModelRoot" }
+$env:ORION_MODEL_ROOT = $ModelRoot
+$ModelFile = Join-Path $ModelRoot 'LLM\Qwen3.5-2B-Q4_K_M.gguf'
 $ModelHash = (Get-FileHash -Algorithm SHA256 $ModelFile).Hash.ToLowerInvariant()
-if ($ModelItem.Length -ne 1280835840) { throw "Unexpected GGUF size: $($ModelItem.Length)" }
-if ($ModelHash -ne 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223') { throw 'GGUF SHA-256 does not match pin.' }
+if ($ModelHash -ne 'a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b') { throw 'GGUF SHA-256 does not match accepted Pi/depot artifact.' }
 ```
+
+Do not fetch models from application startup. Provision them into the depot through the separately approved offline process, and record each model's source, revision, checksum, and license before Pi use.
 
 ### Optional Windows llama.cpp build
 
@@ -121,6 +121,7 @@ Start a loopback-only server in a separate terminal. Find the exact executable p
 ```powershell
 $env:ORION_MODEL_BACKEND = 'llama.cpp'
 $env:ORION_MODEL_BASE_URL = 'http://127.0.0.1:8080/v1'
+$env:ORION_MODEL_ROOT = $ModelRoot
 $env:ORION_MODEL_PATH = $ModelFile
 $env:ORION_LLAMA_SERVER_PATH = $Server
 $env:ORION_MODEL_CONTEXT_SIZE = '4096'
@@ -240,7 +241,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 sudo install -o root -g root -m 0755 /home/orion/.local/bin/uv /usr/local/bin/uv
 sudo env UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-bootstrap /usr/local/bin/uv python install 3.12
 sudo install -d -o orion-service -g orion-service -m 0750 /opt/orion/.venv-voice
-sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-install-project --no-install-package tflite-runtime --extra voice --extra wakeword --extra pi --extra test --python 3.12 --project /opt/orion
+sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv sync --locked --no-install-project --no-install-package tflite-runtime --extra voice --extra wakeword --extra embedding --extra pi --extra test --python 3.12 --project /opt/orion
 ```
 
 Build and install ORION wheel into that locked environment. This keeps the application tree root-owned and read-only:
@@ -255,7 +256,28 @@ sudo -u orion-service sh -c 'cd /var/cache/orion/wheels && HOME=/var/lib/orion U
 sudo -u orion-service env HOME=/var/lib/orion UV_PYTHON_INSTALL_DIR=/opt/orion/python UV_CACHE_DIR=/var/cache/orion/uv-cache UV_PROJECT_ENVIRONMENT=/opt/orion/.venv-voice /usr/local/bin/uv pip check --python /opt/orion/.venv-voice/bin/python
 ```
 
-### Install VOSK and provision KittenTTS cache
+### Copy offline depot and provision VOSK/KittenTTS fallback assets
+
+From PowerShell at the ORION checkout, copy the adjacent depot once during provisioning. This is a manual asset transfer; model selection and runtime startup never download files.
+
+```powershell
+scp -r ..\ORION-MODELS orion.local:/home/orion/
+```
+
+On Pi, copy the uppercase depot into the configured runtime root. Keep the VOSK fallback directory alongside those depot categories; the depot itself does not include VOSK.
+
+```sh
+sudo install -d -o root -g orion-service -m 0755 /opt/orion/models
+sudo rsync -a --chown=root:orion-service --chmod=D755,F644 /home/orion/ORION-MODELS/ /opt/orion/models/
+```
+
+Verify expected files before starting ORION:
+
+```sh
+find /opt/orion/models/LLM /opt/orion/models/STT /opt/orion/models/TTS /opt/orion/models/EMBEDDING -maxdepth 1 -type f -printf '%p\n'
+```
+
+Do not assume every listed model is Pi-compatible or licensed for redistribution. Run `orion-model list` and `orion-model validate <id>` after installation; benchmark candidate LLMs one at a time.
 
 ```sh
 mkdir -p /home/orion/orion/models
@@ -263,7 +285,7 @@ curl -L --fail --retry 5 --retry-all-errors -o /tmp/vosk-model.zip https://alpha
 unzip -q /tmp/vosk-model.zip -d /home/orion/orion/models
 rm /tmp/vosk-model.zip
 sudo install -d -o root -g orion-service -m 0755 /opt/orion/models
-sudo rsync -a --delete --chown=root:orion-service --chmod=D755,F644 /home/orion/orion/models/vosk-model-small-en-us-0.15/ /opt/orion/models/vosk-model-small-en-us-0.15/
+sudo rsync -a --chown=root:orion-service --chmod=D755,F644 /home/orion/orion/models/vosk-model-small-en-us-0.15/ /opt/orion/models/vosk-model-small-en-us-0.15/
 sudo -u orion-service env HOME=/var/lib/orion HF_HOME=/var/cache/orion/huggingface HF_HUB_OFFLINE=0 /opt/orion/.venv-voice/bin/python -c 'from kittentts import KittenTTS; KittenTTS("KittenML/kitten-tts-nano-0.2").generate("Ready.", voice="expr-voice-3-f")'
 ```
 
@@ -284,19 +306,18 @@ cmake --build build --config Release --target llama-server --parallel 4
 ./build/bin/llama-server --version
 ```
 
-Expected version contains commit `d81235049`. Install model from the verified Windows download or download from the pinned URL. When copying from Windows, run in PowerShell at the checkout:
+Expected version contains commit `d81235049`. Install the verified Q4 artifact from the copied offline depot. The application does not download model files.
 
 ```powershell
-$ModelFile = Join-Path $env:LOCALAPPDATA 'ORION\models\Qwen3.5-2B-Q4_K_M.gguf'
-scp $ModelFile orion.local:/home/orion/Qwen3.5-2B-Q4_K_M.gguf
+scp ..\ORION-MODELS\LLM\Qwen3.5-2B-Q4_K_M.gguf orion.local:/home/orion/ORION-MODELS/LLM/
 ```
 
 On Pi, install binary and its colocated shared libraries. Both `orion` login and `orion-service` need read/execute access because deploy preflight runs as login user and systemd runs as service user. Model remains read-only:
 
 ```sh
-printf '%s  %s\n' 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223' /home/orion/Qwen3.5-2B-Q4_K_M.gguf | sha256sum --check
-sudo install -d -o root -g orion-service -m 0755 /opt/orion/models /opt/orion/llama.cpp/bin
-sudo install -o root -g orion-service -m 0644 /home/orion/Qwen3.5-2B-Q4_K_M.gguf /opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf
+printf '%s  %s\n' 'a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b' /home/orion/ORION-MODELS/LLM/Qwen3.5-2B-Q4_K_M.gguf | sha256sum --check
+sudo install -d -o root -g orion-service -m 0755 /opt/orion/models/LLM /opt/orion/llama.cpp/bin
+sudo install -o root -g orion-service -m 0644 /home/orion/ORION-MODELS/LLM/Qwen3.5-2B-Q4_K_M.gguf /opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf
 sudo cp -a /home/orion/llama.cpp-phase14/build/bin/. /opt/orion/llama.cpp/bin/
 sudo chown -R root:orion-service /opt/orion/llama.cpp
 sudo find /opt/orion/llama.cpp -type d -exec chmod 0755 {} +
@@ -309,15 +330,15 @@ Verify as login user:
 
 ```sh
 test -x /usr/local/bin/llama-server
-test -r /opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf
-printf '%s  %s\n' 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223' /opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf | sha256sum --check
+test -r /opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf
+printf '%s  %s\n' 'a8b50de00b780c0f3c16f07cb041a1ecd678b6e22fd8cde91e57fe4b5031523b' /opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf | sha256sum --check
 /usr/local/bin/llama-server --version
 ```
 
 Start server only for a manual local smoke test, with no service active on port 8080:
 
 ```sh
-/usr/local/bin/llama-server -m /opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf --host 127.0.0.1 --port 8080 -c 4096 -t 4 --jinja --no-mmproj --reasoning-format deepseek
+/usr/local/bin/llama-server -m /opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf --host 127.0.0.1 --port 8080 -c 4096 -t 4 --jinja --no-mmproj --reasoning-format deepseek
 ```
 
 In another Pi shell, verify model health, the model chat template, tokenizer, and one streamed completion. Stop temporary server with `Ctrl+C` before starting systemd. Never bind it to `0.0.0.0`.
@@ -347,11 +368,12 @@ Confirm these settings in `/etc/orion/orion.env`:
 
 ```ini
 ORION_DATABASE_PATH=/var/lib/orion/orion.sqlite3
-ORION_STT_MODEL_PATH=/opt/orion/models/vosk-model-small-en-us-0.15
+ORION_MODEL_ROOT=/opt/orion/models
+ORION_VOSK_MODEL_PATH=/opt/orion/models/vosk-model-small-en-us-0.15
 ORION_AUDIO_DEVICE=sysdefault
 ORION_MODEL_BACKEND=llama.cpp
 ORION_MODEL_BASE_URL=http://127.0.0.1:8080/v1
-ORION_MODEL_PATH=/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf
+ORION_MODEL_PATH=/opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf
 ORION_LLAMA_SERVER_PATH=/usr/local/bin/llama-server
 ORION_MODEL_CONTEXT_SIZE=4096
 ORION_MAX_CONTEXT_TOKENS=3072
@@ -365,6 +387,21 @@ HF_HOME=/var/cache/orion/huggingface
 UV_CACHE_DIR=/var/cache/orion/uv-cache
 UV_PYTHON_INSTALL_DIR=/opt/orion/python
 ```
+
+The selection file defaults to `/var/lib/orion/model-selection.json`, beside SQLite. Keep it writable by `orion-service`. Run model commands as that account so selection survives service restart:
+
+```sh
+sudo -u orion-service /opt/orion/.venv-voice/bin/orion-model list
+sudo -u orion-service /opt/orion/.venv-voice/bin/orion-model current
+sudo -u orion-service /opt/orion/.venv-voice/bin/orion-model validate qwen3.5-2b-q4
+sudo -u orion-service /opt/orion/.venv-voice/bin/orion-model use qwen3.5-2b-q4
+sudo systemctl restart orion.service
+sudo systemctl stop orion.service
+sudo -u orion-service /opt/orion/.venv-voice/bin/orion-model benchmark --all
+sudo systemctl start orion.service
+```
+
+`orion-model use` updates persisted selection; it does not restart the service. Benchmarking loads each GGUF sequentially and can consume most available RAM. Run it only as a supervised hardware test. Results default to `/var/lib/orion/model-benchmarks.json`.
 
 Do not add API keys or passwords. Keep wakeword disabled and VOSK selected until custom `Hey Orion` assets pass separate provenance, license, ONNX, and acoustic acceptance.
 
@@ -406,12 +443,18 @@ Test key auth before deploy:
 ssh -o BatchMode=yes orion.local 'hostname; uname -m'
 ```
 
-Phase 14 is the production LLM runtime. The deploy script checks model hash and server commit before stopping the service, backs up source/unit/environment/database, sets managed model settings, runs tests, and rolls back source/config if deployment fails. It does not copy the model or build llama.cpp. This promotes only the LLM runtime; wakeword, audio, sustained performance, and fresh-image acceptance remain separate gates.
+Phase 14 remains the production LLM runtime. The deploy script checks the pinned Q4 hash and llama.cpp commit before stopping the service, backs up source/unit/environment/database, installs locked voice/wakeword/embedding dependencies, and rolls source/config back if deployment fails. It sets `ORION_MODEL_ROOT` and accepts Q4 under `LLM/` or at the historical flat path. It does not copy the depot or build llama.cpp; provision offline assets first. Use `-RemoteModelRoot` for a non-default Pi depot path. Wakeword, audio, sustained performance, and fresh-image acceptance remain separate gates.
 
-After artifacts and service prerequisites are present:
+After the depot is copied to `/opt/orion/models` (or the path passed through `-RemoteModelRoot`) and service prerequisites are present:
 
 ```powershell
 .\scripts\deploy-pi.ps1 -Target orion.local
+```
+
+For a non-default depot location:
+
+```powershell
+.\scripts\deploy-pi.ps1 -Target orion.local -RemoteModelRoot /srv/orion-models
 ```
 
 For an IP target without SSH alias configuration:
@@ -477,6 +520,6 @@ A fresh flash replaces the old boot media. Keep a second backup copy off-Pi befo
 
 ## 9. Current Pi State And Open Gates
 
-As of 2026-10-07, Pi has the verified Qwen GGUF at `/opt/orion/models/Qwen3.5-2B-Q4_K_M.gguf` and llama.cpp at the pinned commit, installed under `/opt/orion/llama.cpp/bin` with `/usr/local/bin/llama-server`. SHA, file permissions, model load, chat template, tokenizer, `/props`, and streamed completion passed smoke tests. The owner confirms the Phase 14 production deployment and validation completed on Pi on 2026-10-08. This workstation could not independently recheck the live host because SSH timed out. Remaining Phase 16 acceptance is still open.
+As of 2026-10-09, Pi has the verified Qwen GGUF at `/opt/orion/models/LLM/Qwen3.5-2B-Q4_K_M.gguf` and llama.cpp at the pinned commit, installed under `/opt/orion/llama.cpp/bin` with `/usr/local/bin/llama-server`. SHA, file permissions, model load, chat template, tokenizer, `/props`, and streamed completion passed smoke tests. The owner confirms Phase 14 production deployment and validation on Pi. A trained Hey Orion candidate now exists in the adjacent local model depot and passes ONNX structural/inference checks; deployment is configured to upload it and select `hey-orion`. The Pi remains on legacy/VOSK until manifest validation and acoustic acceptance pass. Phase 15 model registry/Piper changes and remaining Phase 16 acceptance are not Pi-verified.
 
-Custom production `Hey Orion` assets are still absent. Do not enable wakeword mode. Read [docs/phase13-artifacts.md](docs/phase13-artifacts.md) and [Phase13-Handoff.md](Phase13-Handoff.md) before training/provisioning wake assets. Pi performance, offline clean-boot, audio acoustics, mute/reboot persistence, reminders, and 30-minute soak still need measured acceptance.
+The training-produced `phase13-artifacts.json` manifest is not in this checkout or the local depot yet. Do not enable wakeword capture until that manifest validates on Pi. Pi performance, offline clean-boot, wake acoustics, mute/reboot persistence, reminders, and 30-minute soak still need measured acceptance.

@@ -192,6 +192,46 @@ class PushToTalkInput(VoskTranscriber):
                 timer.cancel()
 
 
+class WhisperPushToTalkInput(PushToTalkInput):
+    """Use existing PTT capture and VAD with the selected whisper.cpp model."""
+
+    def __init__(self, settings: Settings, button, transcriber, **kwargs):
+        super().__init__(settings, button, **kwargs)
+        self.transcriber = transcriber
+
+    def transcribe_chunks(self, chunks, stop_event: _TurnStopEvent | None = None) -> str:
+        started_at = time.perf_counter()
+        outcome = "failed"
+        pcm = bytearray()
+        try:
+            for chunk in self.vad.utterance_chunks(self._until_stopped(chunks, stop_event)):
+                pcm.extend(chunk)
+            if self.stop_event.is_set() or (stop_event and stop_event.is_set()):
+                outcome = "cancelled"
+                return ""
+            if not pcm:
+                outcome = "empty"
+                return ""
+            transcript = self.transcriber.transcribe(
+                bytes(pcm),
+                cancel_event=stop_event or self.stop_event,
+                timeout=self.settings.stt_timeout,
+            )
+            outcome = "transcribed" if transcript else "empty"
+            return transcript
+        finally:
+            self._close_chunks(chunks)
+            logger.info(
+                "Voice stage=stt elapsed_ms=%.1f outcome=%s",
+                (time.perf_counter() - started_at) * 1000,
+                outcome,
+            )
+
+    def close(self) -> None:
+        self.transcriber.close()
+        super().close()
+
+
 class WakeWordInput(VoskTranscriber):
     def __init__(self, settings: Settings, detector, *, on_wake=None, **kwargs):
         super().__init__(settings, **kwargs)

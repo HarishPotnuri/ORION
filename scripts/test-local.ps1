@@ -28,6 +28,11 @@ try {
         throw "ORION configuration check failed."
     }
 
+    & (Join-Path $root ".venv-local\Scripts\orion-model.exe") current
+    if ($LASTEXITCODE -ne 0) {
+        throw "ORION model-selection CLI check failed."
+    }
+
     & $python -m orion --request "What time is it?"
     if ($LASTEXITCODE -ne 0) {
         throw "Local time request failed."

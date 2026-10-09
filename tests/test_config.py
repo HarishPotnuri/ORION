@@ -33,6 +33,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.status_led_blue_pin, 17)
         self.assertEqual(settings.voice_profile, "legacy")
         self.assertEqual(settings.stt_backend, "vosk")
+        self.assertEqual(settings.active_wakeword_model, "hey-orion")
         self.assertEqual(
             settings.stt_model_path,
             Path("models/vosk-model-en-us-0.22-lgraph"),
@@ -45,12 +46,66 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.audio_device, "USB fallback")
 
+    def test_hey_orion_is_selected_for_wakeword_profile(self) -> None:
+        model_root = Path.cwd() / "depot"
+        with self.clean_environment({
+            "ORION_MODEL_ROOT": str(model_root),
+            "ORION_VOICE_PROFILE": "wakeword",
+            "ORION_WAKEWORD_MODEL_ID": "hey-orion",
+        }):
+            settings = Settings.from_environment()
+
+        self.assertEqual(settings.active_wakeword_model, "hey-orion")
+        self.assertEqual(
+            settings.wake_word_model_path,
+            model_root / "WAKEWORD" / "hey_orion.onnx",
+        )
+        self.assertEqual(
+            settings.wake_word_melspectrogram_path,
+            model_root / "WAKEWORD" / "melspectrogram.onnx",
+        )
+        self.assertEqual(
+            settings.wake_word_embedding_path,
+            model_root / "WAKEWORD" / "embedding_model.onnx",
+        )
+        self.assertEqual(
+            settings.wake_word_manifest_path,
+            model_root / "WAKEWORD" / "phase13-artifacts.json",
+        )
+
     def test_local_tts_model_path_can_be_configured(self) -> None:
         model_path = Path.cwd() / "kitten-model"
         with self.clean_environment({"ORION_TTS_MODEL_PATH": str(model_path)}):
             settings = Settings.from_environment()
 
         self.assertEqual(settings.tts_model_path, model_path)
+
+    def test_piper_uses_local_voice_path_and_candidate_voice_default(self) -> None:
+        model_path = Path.cwd() / "en_US-lessac-medium.onnx"
+        with self.clean_environment({
+            "ORION_TTS_BACKEND": "piper",
+            "ORION_TTS_MODEL_PATH": str(model_path),
+        }):
+            settings = Settings.from_environment()
+
+        self.assertEqual(settings.tts_backend, "piper")
+        self.assertEqual(settings.tts_model_path, model_path)
+        self.assertEqual(settings.tts_voice, "en_US-lessac-medium")
+        self.assertEqual(settings.tts_threads, 2)
+        self.assertEqual(settings.runtime_idle_timeout, 60.0)
+
+    def test_piper_requires_a_local_onnx_voice_path(self) -> None:
+        with self.clean_environment({"ORION_TTS_BACKEND": "piper"}):
+            with self.assertRaisesRegex(ValueError, "requires ORION_TTS_MODEL_PATH"):
+                Settings.from_environment()
+
+    def test_runtime_idle_timeout_must_be_finite_and_positive(self) -> None:
+        for value in ("nan", "0"):
+            with self.subTest(value=value), self.clean_environment(
+                {"ORION_RUNTIME_IDLE_TIMEOUT": value}
+            ):
+                with self.assertRaisesRegex(ValueError, "must be finite and positive"):
+                    Settings.from_environment()
 
     def test_legacy_wake_word_uses_configurable_local_jarvis_assets(self) -> None:
         with self.clean_environment({
@@ -100,6 +155,33 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.voice_profile, "legacy")
         self.assertEqual(settings.stt_backend, "vosk")
         self.assertFalse(settings.wake_word_enabled)
+
+    def test_vosk_model_path_keeps_legacy_override_and_adds_named_override(self) -> None:
+        legacy_path = Path.cwd() / "legacy-vosk"
+        named_path = Path.cwd() / "named-vosk"
+        with self.clean_environment({"ORION_STT_MODEL_PATH": str(legacy_path)}):
+            legacy_settings = Settings.from_environment()
+        with self.clean_environment({"ORION_VOSK_MODEL_PATH": str(named_path)}):
+            named_settings = Settings.from_environment()
+
+        self.assertEqual(legacy_settings.stt_model_path, legacy_path)
+        self.assertEqual(legacy_settings.vosk_model_path, legacy_path)
+        self.assertEqual(named_settings.stt_model_path, named_path)
+        self.assertEqual(named_settings.vosk_model_path, named_path)
+
+    def test_legacy_whisper_backend_without_model_id_uses_base_en_depot_asset(self) -> None:
+        with self.clean_environment({
+            "ORION_STT_BACKEND": "whisper.cpp",
+            "ORION_MODEL_ROOT": str(Path.cwd() / "offline-depot"),
+        }):
+            settings = Settings.from_environment()
+
+        self.assertEqual(settings.active_stt_model, "whisper-base-en")
+        self.assertEqual(settings.stt_backend, "whisper.cpp")
+        self.assertEqual(
+            settings.stt_model_path,
+            Path.cwd() / "offline-depot" / "STT" / "ggml-base.en.bin",
+        )
 
     def test_rejects_non_local_model_endpoint(self) -> None:
         with self.clean_environment(

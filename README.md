@@ -5,7 +5,7 @@ For a clean Windows development machine or freshly flashed Raspberry Pi, follow 
 ### Clear Conversation History
 
 After wakeword activation, say "clear conversation history" to reset recent conversation context without restarting the voice service. "Clear chat history", "reset our conversation", and "wipe conversational memory" also work. The command runs without model inference and leaves saved facts, preferences, decisions, episodes, and reminders unchanged. Neither the command nor its acknowledgement enters the new conversation history. This does not correct speech recognition or remove misunderstandings already saved as durable memories.
-Local voice assistant running on Raspberry Pi 5 with custom wakeword activation, Whisper STT, pinned local llama.cpp inference, and KittenTTS
+Privacy-first local voice assistant for Raspberry Pi 5. Legacy/VOSK remains default; wakeword, Whisper, and Piper profiles stay opt-in until acceptance.
 
 ## ORION local tools
 
@@ -28,11 +28,85 @@ To test local reasoning, provision the pinned Qwen3.5-2B GGUF and a compatible `
 
 ```powershell
 $env:ORION_MODEL_BACKEND = "llama.cpp"
+$env:ORION_MODEL_ROOT = Join-Path (Split-Path -Parent (Get-Location).Path) "ORION-MODELS"
 $env:ORION_MODEL_BASE_URL = "http://127.0.0.1:8080/v1"
-$env:ORION_MODEL_PATH = Join-Path $env:LOCALAPPDATA "ORION\models\Qwen3.5-2B-Q4_K_M.gguf"
+$env:ORION_MODEL_PATH = Join-Path $env:ORION_MODEL_ROOT "LLM\Qwen3.5-2B-Q4_K_M.gguf"
 $env:ORION_LLAMA_SERVER_PATH = "C:\path\to\llama-server.exe"
 & .\.venv-local\Scripts\orion.exe --request "Explain Kafka briefly."
 ```
+
+## Offline Model Depot
+
+The Windows development default is `ORION-MODELS`, adjacent to the `ORION` checkout. Override it with `ORION_MODEL_ROOT`. The Pi default is `/opt/orion/models`; set `ORION_MODEL_ROOT` in `/etc/orion/orion.env` when the depot lives elsewhere. Runtime uses the depot's uppercase folders directly and never scans for or downloads missing assets.
+
+```text
+ORION-MODELS/
+	LLM/        five GGUF models
+	STT/        Whisper tiny.en, base.en, and multilingual base
+	TTS/        two Piper ONNX voices and adjacent JSON configs
+	EMBEDDING/  BGE-small-en-v1.5 ONNX
+	WAKEWORD/   Hey Orion classifier candidate and companion data
+```
+
+Registry inventory:
+
+- `qwen3.5-2b-q4`: `LLM/Qwen3.5-2B-Q4_K_M.gguf`; `qwen3.5-2b-q8`: `LLM/Qwen3.5-2B-Q8_0.gguf`.
+- `qwen3-1.7b-q8`: `LLM/Qwen3-1.7B-Q8_0.gguf`; `phi4-mini-q4`: `LLM/Phi-4-mini-instruct-Q4_K_M.gguf`; `gemma4-e2b-q8`: `LLM/gemma-4-E2B-Q8_0.gguf`.
+- `whisper-tiny-en`: `STT/ggml-tiny.en.bin`; `whisper-base-en`: `STT/ggml-base.en.bin`; `whisper-base-multilingual`: `STT/ggml-base.bin`.
+- `piper-lessac-medium`: `TTS/en_US-lessac-medium.onnx`; `piper-hfc-female-medium`: `TTS/en_US-hfc_female-medium.onnx`. Each requires its matching `.onnx.json` sidecar. `kittentts-nano` remains available through the current local/cache adapter.
+- `bge-small-en-v1.5`: `EMBEDDING/BGE-small-en-v1.5-model.onnx`.
+- `hey-orion`: trained local `WAKEWORD/hey_orion.onnx` candidate, external weights, and shared feature ONNX files. `phase13-artifacts.json` remains required before activation; Hey Jarvis remains a staging fallback. `vosk-en-small` uses a separately provisioned directory, not this depot.
+
+Piper package and voice licenses still need review. Quantized Q8 models use more storage and may need more RAM than corresponding smaller quantizations; collect target measurements instead of relying on estimates. No candidate's Pi performance is implied by registry presence.
+
+During provisioning, the depot can be copied to the Pi with the commands below. Normal `deploy-pi.ps1` runs compare each local asset's relative path and byte size with the Pi, transferring missing or size-mismatched files while leaving matching assets untouched. This synchronization runs during deployment, not application startup:
+
+```powershell
+scp -r ..\ORION-MODELS orion.local:/home/orion/
+```
+
+```sh
+sudo install -d -o root -g orion-service -m 0755 /opt/orion/models
+sudo rsync -a --chown=root:orion-service --chmod=D755,F644 /home/orion/ORION-MODELS/ /opt/orion/models/
+```
+
+Run the Windows Pi monitor with `scripts/pi-monitor.py` for live stats, logs, and LLM switching. The model picker enables only GGUF files whose Pi byte size matches the local depot. Switching asks for confirmation and Pi sudo password, updates the service model selection, then restarts ORION. Use `--local-model-root`, `--model-root`, `--database-path`, or `--selection-path` for non-default paths. An explicit `ORION_LLM_MODEL_ID` in `/etc/orion/orion.env` blocks UI switching because it overrides saved selection.
+
+`deploy-pi.ps1` syncs only Qwen Q4, Whisper base.en, Piper Lessac and its JSON sidecar, BGE, and the Hey Orion classifier bundle with shared feature models. It sets `ORION_WAKEWORD_MODEL_ID=hey-orion` but keeps wake capture on legacy/VOSK until the production manifest and Pi acoustic acceptance pass. Other model variants are not uploaded. The script stages selected files as local hard links, then uploads them in one synchronous SCP session with visible progress and a larger SFTP request pipeline.
+
+Example persisted selection (`model-selection.json`):
+
+```json
+{
+	"llm": "qwen3.5-2b-q4",
+	"stt": "whisper-base-en",
+	"tts": "piper-lessac-medium",
+	"embedding": "bge-small-en-v1.5",
+	"wakeword": "hey-orion"
+}
+```
+
+Set `ORION_MODEL_ROOT=/opt/orion/models` in the Pi service environment. The active STT ID selects Whisper with PTT or wakeword input; legacy VOSK remains the default until a selection is saved. Wakeword activation still requires `ORION_VOICE_PROFILE=wakeword` or `ORION_WAKE_WORD_ENABLED=true`.
+
+Select IDs through the local state-directory JSON using `orion-model use`. The file is stored beside SQLite by default; the voice service reads it at startup. Run the command as the service account on Pi, then restart the service. Legacy explicit `ORION_MODEL_PATH`, `ORION_STT_MODEL_PATH`, and `ORION_TTS_MODEL_PATH` remain supported unless an ID is selected.
+
+```powershell
+& .\.venv-local\Scripts\orion-model.exe list
+& .\.venv-local\Scripts\orion-model.exe current
+& .\.venv-local\Scripts\orion-model.exe use qwen3.5-2b-q4
+& .\.venv-local\Scripts\orion-model.exe use whisper-base-en
+& .\.venv-local\Scripts\orion-model.exe use piper-lessac-medium
+& .\.venv-local\Scripts\orion-model.exe validate qwen3.5-2b-q4
+& .\.venv-local\Scripts\orion-model.exe benchmark --all
+```
+
+`use` updates one role selection; it does not restart ORION. Switching closes the old owned llama.cpp server before another starts. `benchmark --all` tests the five GGUFs sequentially with four fixed prompts. Stop `orion.service` and any external llama-server first; benchmarking requires its own managed server to measure model load time. Results go to `model-benchmarks.json` beside the selection file by default; `--output` selects another path. Missing metrics are `null`. Benchmarks load real models and consume Pi RAM; run one model at a time on target hardware. `validate` starts an LLM for a short `ORION_OK` generation check. llama.cpp applies each GGUF's native chat template. No model files are required by normal unit tests.
+
+Set `ORION_MODEL_ROOT=/opt/orion/models` in Pi configuration. Set active IDs with `ORION_LLM_MODEL_ID`, `ORION_STT_MODEL_ID`, `ORION_TTS_MODEL_ID`, `ORION_EMBEDDING_MODEL_ID`, and `ORION_WAKEWORD_MODEL_ID`, or use `orion-model use`. The default IDs are Qwen3.5-2B Q4, legacy VOSK, KittenTTS, BGE, and Hey Orion. A missing Hey Orion classifier tries the local Hey Jarvis staging assets, then provisioned VOSK/PTT. Missing VOSK fallback assets produce a clear error. Wakeword mode must be explicitly enabled.
+
+In wakeword mode only, ORION continues wakeword detection during speaker playback. A detected wake interrupts generation/playback; microphone audio is discarded until playback stops, then the next spoken command is captured without another wake phrase. Legacy PTT remains fully capture-suppressed. Acoustic leakage and false wake activation during playback remain Pi acceptance checks; barge-in does not imply echo cancellation.
+
+BGE is exposed through a configurable, lazy embedding-provider interface only. Existing SQLite/FTS retrieval remains unchanged; semantic retrieval is not enabled. The provider verifies that the ONNX accepts direct text, as required by this depot contract. Include `--extra embedding` in the complete `uv sync` profile before validating or calling BGE; avoid partial syncs in an existing voice environment.
 
 ## Raspberry Pi Setup
 
@@ -113,7 +187,9 @@ ORION_WAKE_WORD_MANIFEST_PATH=/opt/orion/models/wakeword/phase13-artifacts.json
 
 In the candidate profile GPIO23 toggles persistent microphone mute/unmute; GPIO16 remains speech interruption. The microphone starts unmuted on a fresh database and retains its state across restarts. A muted or stale transcript cannot dispatch an action or confirm a mutation. Keep the service on `ORION_AUDIO_DEVICE="default"` unless another device has passed the configured sample-rate checks. Missing or incompatible assets fail validation before capture starts. VOSK remains active until the full set passes validation.
 
-`ORION_TTS_MODEL_PATH` is optional and points to a local KittenTTS ONNX model directory. If unset, the existing KittenTTS model identifier uses the pre-provisioned Hugging Face cache while runtime offline mode is enforced. A configured local directory never falls back to Hub access when its config or model files are missing.
+With `ORION_TTS_BACKEND=kittentts`, `ORION_TTS_MODEL_PATH` is optional and points to a local KittenTTS ONNX model directory. If unset, the existing KittenTTS model identifier uses the pre-provisioned Hugging Face cache while runtime offline mode is enforced. A configured local directory never falls back to Hub access when its config or model files are missing.
+
+Phase 15 adds an opt-in Piper path. Set `ORION_TTS_BACKEND=piper` and point `ORION_TTS_MODEL_PATH` to a provisioned voice `.onnx` file with its adjacent `.onnx.json` config. `en_US-lessac-medium` is the initial candidate, not a verified or bundled artifact; verify package and voice licenses before distribution. `ORION_TTS_THREADS` sets CPU inference threads, `ORION_TTS_SAMPLE_RATE` sets playback rate, and `ORION_RUNTIME_IDLE_TIMEOUT` sets lazy LLM/Piper eviction in seconds. Missing assets fail locally; ORION does not download or substitute voices.
 
 ### Download models and configure runtime
 
@@ -128,7 +204,7 @@ rm /tmp/vosk-model.zip
 
 The Phase 14 source selects `llama.cpp`; Ollama is not a supported backend. Provision the pinned Qwen GGUF and build `llama-server` from the exact commit in [Phase 14 model and runtime pins](docs/phase14-artifacts.md). Do not deploy this source to the Pi until Phase 16 promotion and acceptance. The Pi's deployed revision remains on its previous runtime until then. ORION never downloads a model at startup.
 
-KittenTTS setup remains separate. Its first initialization uses pre-provisioned local assets or a Hub cache. Set `HF_HUB_OFFLINE=1` after provisioning to block runtime downloads. Voice startup initializes VOSK and KittenTTS before announcing readiness, including one short discarded TTS warm-up synthesis. On the tested Pi, warm-up took 5.63 seconds online and 4.97 seconds with Hub offline; this moves the cost before readiness and out of the first reply but does not eliminate cold-start synthesis time.
+KittenTTS setup remains separate. Its first initialization uses pre-provisioned local assets or a Hub cache. Set `HF_HUB_OFFLINE=1` after provisioning to block runtime downloads. Voice startup no longer warms STT or TTS. The first utterance pays model initialization cost; the configurable idle monitor releases an inactive owned LLM or Piper model after 60 seconds by default. Phase 15 remains locally tested only; provision and license-check Piper assets before use, then complete Pi audio, interruption, reboot, and soak checks.
 
 For each interactive shell, activate `.venv-voice` and configure ORION. These environment variables are required because settings revert to defaults in a new shell. Add the exports to the user's `~/.bashrc` after validating the setup if they should persist for interactive logins.
 
@@ -279,7 +355,7 @@ Phase 14 is the production LLM runtime. First provision the pinned GGUF and `lla
 \.\scripts\deploy-pi.ps1
 \.\scripts\deploy-pi.ps1 -Target orion.local
 # Use an explicit identity only when SSH config alias is unavailable:
-\.\scripts\deploy-pi.ps1 -Target orion@192.168.0.9 -SshIdentityFile "$HOME\.ssh\orion_pi_ed25519"
+\.\scripts\deploy-pi.ps1 -Target orion@10.159.42.172 -SshIdentityFile "$HOME\.ssh\orion_pi_ed25519"
 # Override if ORION_DATABASE_PATH differs from /var/lib/orion/orion.sqlite3:
 \.\scripts\deploy-pi.ps1 -DatabasePath /custom/path/orion.sqlite3
 ```

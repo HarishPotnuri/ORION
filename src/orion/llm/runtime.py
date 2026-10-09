@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import codecs
+from contextlib import contextmanager
 import json
 import logging
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,7 +23,7 @@ from ..core.contracts import ChatMessage, ModelStreamEvent, ModelUsage
 from ..core.policy import NetworkPolicy
 
 _MAX_RESPONSE_BYTES = 1_048_576
-_STREAM_READ_TIMEOUT = 0.2
+_STREAM_CANCEL_POLL_INTERVAL = 0.05
 _PINNED_LLAMA_COMMIT = "d81235049384534c167caea52b85a694f6103d14"
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,32 @@ logger = logging.getLogger(__name__)
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         return None
+
+
+@contextmanager
+def _interruptible_socket(raw_socket, cancel_event):
+    if raw_socket is None:
+        yield
+        return
+
+    stopped = threading.Event()
+
+    def interrupt_on_cancel():
+        while not stopped.wait(_STREAM_CANCEL_POLL_INTERVAL):
+            if cancel_event.is_set():
+                try:
+                    raw_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+    watcher = threading.Thread(target=interrupt_on_cancel, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        watcher.join(_STREAM_CANCEL_POLL_INTERVAL * 2)
 
 
 class SSEDecoder:
@@ -131,24 +159,55 @@ class LocalJsonTransport:
                     "_sock",
                     None,
                 )
-                if raw_socket is not None:
-                    raw_socket.settimeout(min(timeout, _STREAM_READ_TIMEOUT))
-                while not saw_done:
-                    if cancel_event.is_set():
-                        raise RuntimeError("Local model stream was cancelled")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("Local model stream exceeded its deadline")
-                    try:
-                        chunk = response.read1(min(4096, max(1, _MAX_RESPONSE_BYTES - received_bytes)))
-                    except (socket.timeout, TimeoutError):
-                        continue
-                    if not chunk:
+                with _interruptible_socket(raw_socket, cancel_event):
+                    while not saw_done:
+                        if cancel_event.is_set():
+                            raise RuntimeError("Local model stream was cancelled")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("Local model stream exceeded its deadline")
+                        if raw_socket is not None:
+                            raw_socket.settimeout(remaining)
                         try:
-                            pending_events = decoder.feed(b"", final=True)
+                            chunk = response.read1(min(4096, max(1, _MAX_RESPONSE_BYTES - received_bytes)))
+                        except (socket.timeout, TimeoutError) as error:
+                            if cancel_event.is_set():
+                                raise RuntimeError("Local model stream was cancelled") from error
+                            raise TimeoutError("Local model stream read exceeded its deadline") from error
+                        except OSError as error:
+                            if cancel_event.is_set():
+                                raise RuntimeError("Local model stream was cancelled") from error
+                            raise
+                        if not chunk:
+                            try:
+                                pending_events = decoder.feed(b"", final=True)
+                            except UnicodeDecodeError as error:
+                                raise RuntimeError("Local model stream contains invalid UTF-8") from error
+                            for data in pending_events:
+                                if data == "[DONE]":
+                                    saw_done = True
+                                    break
+                                parsed = self._parse_stream_data(data)
+                                if parsed is None:
+                                    continue
+                                text, usage, finish_reason = parsed
+                                now = time.monotonic()
+                                if text:
+                                    if first_token_at is None:
+                                        first_token_at = now
+                                    yield ModelStreamEvent(kind="text", text=text)
+                                if usage is not None:
+                                    completion_tokens = usage.completion_tokens
+                                    yield ModelStreamEvent(kind="usage", usage=usage)
+                            break
+                        received_bytes += len(chunk)
+                        if received_bytes > _MAX_RESPONSE_BYTES:
+                            raise RuntimeError("Local model stream exceeded the 1 MiB limit")
+                        try:
+                            events = decoder.feed(chunk)
                         except UnicodeDecodeError as error:
                             raise RuntimeError("Local model stream contains invalid UTF-8") from error
-                        for data in pending_events:
+                        for data in events:
                             if data == "[DONE]":
                                 saw_done = True
                                 break
@@ -164,30 +223,6 @@ class LocalJsonTransport:
                             if usage is not None:
                                 completion_tokens = usage.completion_tokens
                                 yield ModelStreamEvent(kind="usage", usage=usage)
-                        break
-                    received_bytes += len(chunk)
-                    if received_bytes > _MAX_RESPONSE_BYTES:
-                        raise RuntimeError("Local model stream exceeded the 1 MiB limit")
-                    try:
-                        events = decoder.feed(chunk)
-                    except UnicodeDecodeError as error:
-                        raise RuntimeError("Local model stream contains invalid UTF-8") from error
-                    for data in events:
-                        if data == "[DONE]":
-                            saw_done = True
-                            break
-                        parsed = self._parse_stream_data(data)
-                        if parsed is None:
-                            continue
-                        text, usage, finish_reason = parsed
-                        now = time.monotonic()
-                        if text:
-                            if first_token_at is None:
-                                first_token_at = now
-                            yield ModelStreamEvent(kind="text", text=text)
-                        if usage is not None:
-                            completion_tokens = usage.completion_tokens
-                            yield ModelStreamEvent(kind="usage", usage=usage)
                 if not saw_done:
                     raise RuntimeError("Local model stream ended before [DONE]")
         except urllib.error.HTTPError as error:
@@ -246,7 +281,9 @@ class LocalJsonTransport:
         if not isinstance(delta, dict):
             raise RuntimeError("Local model stream delta must be an object")
         text = delta.get("content", "")
-        if not isinstance(text, str):
+        if text is None:
+            text = ""
+        elif not isinstance(text, str):
             raise RuntimeError("Local model stream content must be text")
         reason = delta.get("reasoning_content", delta.get("reasoning"))
         if reason is not None and not isinstance(reason, str):

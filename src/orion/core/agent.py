@@ -213,8 +213,9 @@ class AgentController:
                     return self._limit_result(step - 1, "model_timeout")
                 except Exception as error:
                     logger.warning(
-                        "Local model call failed (%s), step %d attempt %d elapsed_ms=%.1f",
+                        "Local model call failed (%s: %s), step %d attempt %d elapsed_ms=%.1f",
                         type(error).__name__,
+                        error,
                         step,
                         attempt + 1,
                         (time.monotonic() - model_started) * 1000,
@@ -349,6 +350,7 @@ class AgentController:
                     save_memory_suggestions=False,
                 )
             except Exception:
+                logger.exception("Planner execution failed during voice stream")
                 yield ModelStreamEvent(kind="failed", error="planning_failed")
                 return
             suggestions = plan_result.memory_suggestions
@@ -417,9 +419,12 @@ class AgentController:
             if suggestions:
                 self._save_memory_suggestions(suggestions)
             yield completion_event or ModelStreamEvent(kind="completed")
-        except TimeoutError:
+        except TimeoutError as error:
+            logger.warning("Streamed model response timed out: %s", error)
             yield ModelStreamEvent(kind="failed", error="model_timeout")
         except Exception:
+            if not cancellation.is_set():
+                logger.exception("Final model stream failed")
             yield ModelStreamEvent(
                 kind="failed",
                 error="cancelled" if cancellation.is_set() else "stream_failed",
