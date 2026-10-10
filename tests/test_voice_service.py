@@ -398,6 +398,10 @@ class VoiceServiceTests(unittest.TestCase):
 
         self.assertEqual(interrupt_button.pin, 16)
         self.assertIsNot(interrupt_button, ptt_button)
+        with gate.interruptible_turn() as cancellation:
+            ptt_button.when_pressed()
+            self.assertFalse(cancellation.is_set())
+            self.assertFalse(gate.capture_cancel_event.is_set())
         with gate.speaking():
             interrupt_button.when_pressed()
             self.assertTrue(gate.wait_for_interrupt(0))
@@ -559,7 +563,7 @@ class VoiceServiceTests(unittest.TestCase):
         class Orchestrator:
             settings = SimpleNamespace(stt_confidence_threshold=0.55)
 
-            def suggest_transcript_correction(self, transcript):
+            def suggest_transcript_correction(self, transcript, *, cancel_event=None):
                 suggestions.append(transcript)
                 return "Remind me to call at five PM"
 
@@ -618,7 +622,7 @@ class VoiceServiceTests(unittest.TestCase):
         class Orchestrator:
             settings = SimpleNamespace(stt_confidence_threshold=0.55)
 
-            def suggest_transcript_correction(self, _transcript):
+            def suggest_transcript_correction(self, _transcript, *, cancel_event=None):
                 return "Remind me to call at five PM"
 
             def handle(self, request):
@@ -815,6 +819,44 @@ class VoiceServiceTests(unittest.TestCase):
         joined_logs = "\n".join(logs.output)
         self.assertIn("generated_text='First. Unsaid tail'", joined_logs)
         self.assertIn("delivered_text='' outcome=interrupted", joined_logs)
+
+    def test_gpio_interrupt_during_buffered_orchestration_suppresses_reply(self):
+        stop_event = threading.Event()
+        scheduler = FakeScheduler()
+        gate = AudioGate()
+        spoken = []
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Do something"
+                stop_event.set()
+                return ""
+
+        class Orchestrator:
+            def handle(self, _request):
+                gate.request_interrupt()
+                return SimpleNamespace(
+                    response="Must not be spoken",
+                    route=SimpleNamespace(kind=SimpleNamespace(value="test")),
+                    completed=True,
+                )
+
+        class Adapter:
+            def speak(self, text):
+                spoken.append(text)
+
+        output = _StatusSpeechOutput(Adapter(), lambda _status: None, gate)
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), output, scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(spoken, [])
+        self.assertTrue(gate.is_open)
 
     def test_gpio_interrupt_cancels_generation_before_first_phrase(self):
         stop_event = threading.Event()

@@ -95,9 +95,15 @@ class WhisperTests(unittest.TestCase):
             result = self.adapter.transcribe(b"\x01\x00\xff\x7f", cancel_event=self.cancel)
         self.assertEqual(json.loads(result), [1, 16000, 2, 2, "0100ff7f"])
         argv, kwargs = self.commands[0]
-        self.assertEqual(argv, [
+        self.assertEqual(argv[:5], [
             str(Path(sys.executable).resolve()), "-m", str(self.model.resolve()),
-            "-f", "-", "-t", "2", "-l", "en", "-ng", "-nt", "-np", "-otxt",
+            "-f", "-",
+        ])
+        self.assertEqual(argv[5], "-of")
+        self.assertEqual(Path(argv[6]).name, "transcript")
+        self.assertFalse(Path(argv[6]).parent.exists())
+        self.assertEqual(argv[7:], [
+            "-t", "2", "-l", "en", "-ng", "-nt", "-np", "-otxt",
         ])
         self.assertFalse(kwargs["shell"])
         self.assertEqual(set(Path(self.directory.name).iterdir()), {self.model})

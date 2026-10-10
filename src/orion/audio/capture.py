@@ -32,6 +32,7 @@ class AudioGate:
         self._ready.set()
         self._interrupt = threading.Event()
         self._turn_cancel = threading.Event()
+        self._capture_cancel = threading.Event()
         self._lock = threading.Lock()
         self._generation = 0
         self._speaking_depth = 0
@@ -62,6 +63,15 @@ class AudioGate:
         return self._turn_cancel
 
     @property
+    def capture_cancel_event(self) -> threading.Event:
+        return self._capture_cancel
+
+    @property
+    def is_speaking(self) -> bool:
+        with self._lock:
+            return self._speaking_depth > 0
+
+    @property
     def turn_active(self) -> bool:
         with self._lock:
             return self._active_turns > 0
@@ -72,6 +82,18 @@ class AudioGate:
                 self._interrupt.set()
             if self._active_turns:
                 self._turn_cancel.set()
+            self._capture_cancel.set()
+
+    def interrupt_playback(self) -> None:
+        with self._lock:
+            if self._speaking_depth:
+                self._interrupt.set()
+                if self._active_turns:
+                    self._turn_cancel.set()
+
+    def begin_capture(self) -> None:
+        with self._lock:
+            self._capture_cancel.clear()
 
     @contextmanager
     def interruptible_turn(self):

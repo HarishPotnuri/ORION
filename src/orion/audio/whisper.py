@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -94,12 +95,14 @@ class WhisperCppTranscriber:
                 return ""
             if time.monotonic() >= deadline:
                 raise TimeoutError("Whisper transcription timed out")
-            argv = [
-                executable, "-m", str(model), "-f", "-",
-                "-t", str(self.settings.stt_threads),
-                "-l", self.settings.stt_language, "-ng", "-nt", "-np", "-otxt",
-            ]
-            return self._run(argv, wav, cancel_event, deadline)
+            with tempfile.TemporaryDirectory(prefix="orion-whisper-") as output_directory:
+                argv = [
+                    executable, "-m", str(model), "-f", "-",
+                    "-of", str(Path(output_directory) / "transcript"),
+                    "-t", str(self.settings.stt_threads),
+                    "-l", self.settings.stt_language, "-ng", "-nt", "-np", "-otxt",
+                ]
+                return self._run(argv, wav, cancel_event, deadline)
         finally:
             self._run_lock.release()
 

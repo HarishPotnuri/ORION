@@ -114,7 +114,10 @@ class WakeListenerInput:
                 if not self.control.allows(token) or not self.gate.wakeword_capture_allowed:
                     continue
                 self.detector.reset()
-                session = _Cancelled(self.stop_event, cancelled, self._session_stop)
+                session = _Cancelled(
+                    self.stop_event, cancelled, self._session_stop,
+                    self.gate.capture_cancel_event,
+                )
                 chunks = self.source.chunks(session)
                 frame = bytearray()
                 while not session.is_set():
@@ -168,7 +171,7 @@ class WakeListenerInput:
                             )
                             barge_in = (
                                 active_turn is None
-                                and self.gate.turn_active
+                                and self.gate.is_speaking
                                 and self.gate.allow_wakeword_during_speech
                             )
                         if self.gate.generation != gate_generation:
@@ -184,7 +187,7 @@ class WakeListenerInput:
                                     if followup_turn else "Wake word detected"
                                 )
                                 if barge_in:
-                                    self.gate.request_interrupt()
+                                    self.gate.interrupt_playback()
                                 if not followup_turn and self.on_wake is not None:
                                     self.on_wake()
                             break
@@ -192,7 +195,7 @@ class WakeListenerInput:
                         continue
                     with self._turn_lock:
                         if barge_in:
-                            if not self.gate.turn_active or self._active_turn is not None:
+                            if not self.gate.is_speaking or self._active_turn is not None:
                                 continue
                             self._turn_sequence += 1
                             active_turn = self._turn_sequence
@@ -217,7 +220,7 @@ class WakeListenerInput:
                     frame.clear()
                     turn_stop = _Cancelled(
                         self.stop_event, cancelled, self._session_stop, turn_cancel,
-                        deadline=turn_deadline,
+                        self.gate.capture_cancel_event, deadline=turn_deadline,
                     )
 
                     def speech_chunks():
@@ -306,6 +309,7 @@ class WakeListenerInput:
         with self._call_lock:
             if self.stop_event.is_set():
                 return ""
+            self.gate.begin_capture()
             self.start()
             self._clear_results()
             self._turn_token = None
@@ -323,10 +327,20 @@ class WakeListenerInput:
                     return ""
                 text = self._transcribe(
                     pcm,
-                    cancel_event=_Cancelled(self.stop_event, captured_cancel, deadline=deadline),
+                    cancel_event=_Cancelled(
+                        self.stop_event, captured_cancel,
+                        self.gate.turn_cancel_event,
+                        self.gate.capture_cancel_event,
+                        deadline=deadline,
+                    ),
                     timeout=remaining,
                 )
-                if self.control.allows(token) and not self.stop_event.is_set():
+                if (
+                    self.control.allows(token)
+                    and not self.stop_event.is_set()
+                    and not self.gate.turn_cancel_event.is_set()
+                    and not self.gate.capture_cancel_event.is_set()
+                ):
                     self._turn_token = token
                     return text
                 return ""
@@ -353,6 +367,8 @@ class WakeListenerInput:
                 while not self.stop_event.is_set():
                     if (
                         turn_cancel.is_set()
+                        or self.gate.turn_cancel_event.is_set()
+                        or self.gate.capture_cancel_event.is_set()
                         or control_cancel.is_set()
                         or not self.control.allows(control_token)
                     ):
@@ -384,12 +400,18 @@ class WakeListenerInput:
                         pcm,
                         cancel_event=_Cancelled(
                             self.stop_event, captured_cancel, captured_turn_cancel,
-                            deadline=deadline,
+                            self.gate.capture_cancel_event, deadline=deadline,
                         ),
                         timeout=remaining,
                     )
                     logger.info("Voice stage=stt elapsed_ms=%.1f outcome=%s", (time.monotonic() - started) * 1000, "transcribed" if text else "empty")
-                    if self.control.allows(token) and not self.stop_event.is_set():
+                    if (
+                        self.control.allows(token)
+                        and not self.stop_event.is_set()
+                        and not turn_cancel.is_set()
+                        and not self.gate.turn_cancel_event.is_set()
+                        and not self.gate.capture_cancel_event.is_set()
+                    ):
                         self._turn_token = token
                         return text
                     return ""

@@ -193,7 +193,9 @@ class RequestOrchestrator:
             (time.monotonic() - started) * 1000,
         )
 
-    def suggest_transcript_correction(self, transcript: str) -> str | None:
+    def suggest_transcript_correction(
+        self, transcript: str, *, cancel_event: threading.Event | None = None
+    ) -> str | None:
         repair_settings = replace(self.settings, max_agent_steps=1)
         agent = AgentController(
             repair_settings,
@@ -215,6 +217,7 @@ class RequestOrchestrator:
                 self.settings.max_tool_execution_time,
                 self.settings.max_total_task_time,
             ),
+            cancel_event=cancel_event,
             save_memory_suggestions=False,
         )
         if not result.completed:

@@ -396,7 +396,7 @@ def _create_interrupt_button(settings: Settings, gate: AudioGate, push_to_talk_b
         and settings.voice_profile == "legacy"
         and not settings.wake_word_enabled
     ):
-        push_to_talk_button.when_pressed = gate.request_interrupt
+        push_to_talk_button.when_pressed = gate.interrupt_playback
     return interrupt_button
 
 
@@ -438,6 +438,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
             spoken = False
             generated_text: list[str] = []
             delivered_text: list[str] = []
+            turn = getattr(speech_output, "turn", None)
+            turn_context = turn() if turn is not None else nullcontext(Event())
+            cancellation = turn_context.__enter__()
             try:
                 set_status(
                     "IDLE"
@@ -458,6 +461,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                 )
                 if stop_event.is_set():
                     break
+                if cancellation.is_set():
+                    followup_active = False
+                    continue
                 if not transcript.strip():
                     if isinstance(audio_input, WakeListenerInput):
                         followup_active = False
@@ -492,12 +498,17 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     suggestion = None
                     if suggest_correction is not None:
                         try:
-                            suggestion = suggest_correction(transcript)
+                            suggestion = suggest_correction(
+                                transcript, cancel_event=cancellation
+                            )
                         except Exception as error:
                             logger.warning(
                                 "Transcript correction suggestion failed (%s)",
                                 type(error).__name__,
                             )
+                    if cancellation.is_set():
+                        followup_active = False
+                        continue
                     logger.info(
                         "Voice stage=llm_generation turn=%d purpose=transcript_recovery elapsed_ms=%.1f outcome=%s",
                         turn_number,
@@ -516,6 +527,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                         speech_output.speak(
                             f"I may have misheard you. Did you mean: {suggestion}? Say yes to use it, or no to repeat."
                         )
+                        if cancellation.is_set():
+                            followup_active = False
+                            continue
                         confirmation = _capture_transcript_confirmation(
                             audio_input, followup_active=followup_active
                         )
@@ -536,6 +550,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                                 original_transcript,
                                 transcript,
                             )
+                    if cancellation.is_set():
+                        followup_active = False
+                        continue
 
                     if not accepted_correction:
                         speech_output.speak(
@@ -543,6 +560,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                             if suggestion
                             else "I couldn't understand that. Please repeat your request."
                         )
+                        if cancellation.is_set():
+                            followup_active = False
+                            continue
                         retry_started = time.monotonic()
                         repeated_transcript = _capture_transcript_confirmation(
                             audio_input, followup_active=followup_active
@@ -569,6 +589,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                             )
                             followup_active = False
                             continue
+                    if cancellation.is_set():
+                        followup_active = False
+                        continue
 
                 router = getattr(orchestrator, "router", None)
                 decision = router.route(transcript) if router is not None else None
@@ -597,6 +620,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                             turn_number,
                         )
                     result = orchestrator.handle(transcript)
+                    if cancellation.is_set():
+                        followup_active = False
+                        continue
                     generated_text.append(result.response)
                     logger.info(
                         "Voice response turn=%d generated_text=%r outcome=%s",
@@ -624,6 +650,9 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     stage_name = "tts"
                     stage_started = time.monotonic()
                     speech_completed = speech_output.speak(result.response)
+                    if cancellation.is_set():
+                        followup_active = False
+                        continue
                     if speech_completed is not False and not stop_event.is_set():
                         delivered_text.append(result.response)
                     logger.info(
@@ -655,12 +684,7 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                             turn_number,
                         )
                     session = getattr(speech_output, "session", None)
-                    turn = getattr(speech_output, "turn", None)
                     with ExitStack() as active_turn:
-                        cancellation = (
-                            active_turn.enter_context(turn())
-                            if turn is not None else Event()
-                        )
                         session_started = False
                         if isinstance(orchestrator, RequestOrchestrator):
                             stream = iter(
@@ -752,9 +776,7 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                         if speech_delivery_started is not None else 0.0,
                         "interrupted" if interrupted else "completed" if delivered_text else "no_output",
                     )
-                    followup_active = next_followup is not None and (
-                        completed or interrupted
-                    )
+                    followup_active = next_followup is not None and completed
                     logger.info(
                         "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=stream completed=%s failed=%s",
                         turn_number,
@@ -786,6 +808,8 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                 )
                 set_status("ERROR")
                 if not stop_event.is_set() and not spoken:
+                    if cancellation.is_set():
+                        continue
                     try:
                         speech_output.speak(
                             "I couldn't process that turn. Please try again."
@@ -797,6 +821,8 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                         )
                 if not stop_event.wait(0.5):
                     set_status("LISTENING")
+            finally:
+                turn_context.__exit__(None, None, None)
     finally:
         stop_event.set()
         try:

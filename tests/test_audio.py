@@ -224,6 +224,22 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(audio_input.next_utterance(timeout=0.01), "")
         self.assertFalse(service_stop.is_set())
 
+    def test_push_to_talk_interrupt_during_capture_wait_returns_empty(self):
+        gate = AudioGate()
+
+        class InterruptingButton:
+            is_pressed = False
+
+            def wait_for_press(self, timeout=None):
+                gate.request_interrupt()
+
+        audio_input = PushToTalkInput(
+            self.small_settings(), InterruptingButton(), gate=gate
+        )
+
+        self.assertEqual(audio_input.next_utterance(timeout=1), "")
+        self.assertTrue(gate.capture_cancel_event.is_set())
+
     def test_capture_overflow_discards_utterance(self):
         settings = self.small_settings(audio_queue_chunks=1)
 

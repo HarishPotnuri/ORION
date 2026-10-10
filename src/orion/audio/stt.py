@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class _TurnStopEvent:
-    def __init__(self, service_stop: threading.Event, timeout_stop: threading.Event):
-        self._events = (service_stop, timeout_stop)
+    def __init__(self, *events: threading.Event):
+        self._events = events
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self._events)
@@ -167,7 +167,10 @@ class VoskTranscriber:
 
     def _turn_stop(self, timeout: float | None):
         timeout_stop = threading.Event()
-        combined = _TurnStopEvent(self.stop_event, timeout_stop)
+        combined = _TurnStopEvent(
+            self.stop_event, timeout_stop, self.gate.turn_cancel_event,
+            self.gate.capture_cancel_event,
+        )
         timer = None
         if timeout is not None:
             if timeout <= 0:
@@ -191,6 +194,7 @@ class PushToTalkInput(VoskTranscriber):
         self.button = button
 
     def next_utterance(self, timeout: float | None = None) -> str:
+        self.gate.begin_capture()
         turn_stop, timer = self._turn_stop(timeout)
         wait_started = time.perf_counter()
         try:

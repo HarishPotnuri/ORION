@@ -353,6 +353,40 @@ def test_no_wake_never_transcribes_even_voiced_pcm(harness):
     assert not harness.stop.is_set()
 
 
+def test_interrupt_cancels_pending_wake_listener_capture(harness):
+    call = harness.request(timeout=1)
+    harness.source.next_session()
+
+    harness.gate.request_interrupt()
+
+    assert call.result() == ""
+    assert harness.transcriber.calls == []
+
+
+def test_interrupt_discards_deferred_barge_in_transcript(harness):
+    harness.transcriber.release.clear()
+    harness.listener._pending_barge_in = (
+        harness.control.generation,
+        harness.control.cancel_event,
+        b"\x00\x00",
+    )
+    outcomes = queue.Queue()
+
+    with harness.gate.interruptible_turn():
+        call = threading.Thread(
+            target=lambda: outcomes.put(harness.listener.next_utterance()),
+            daemon=True,
+        )
+        call.start()
+        assert harness.transcriber.entered.wait(WAIT)
+        harness.gate.request_interrupt()
+        harness.transcriber.release.set()
+        call.join(WAIT)
+
+    assert not call.is_alive()
+    assert outcomes.get_nowait() == ""
+
+
 def test_wake_followed_by_silence_does_not_transcribe(harness):
     call = harness.request()
     session = harness.source.next_session()
