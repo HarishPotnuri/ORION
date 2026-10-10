@@ -20,9 +20,11 @@ class ReminderNotifier:
         self,
         speak: Callable[[str], None],
         set_status: Callable[[str], None],
+        on_speech_complete: Callable[[], None] | None = None,
     ):
         self.speak = speak
         self.set_status = set_status
+        self.on_speech_complete = on_speech_complete
 
     def __call__(self, reminder: Reminder) -> None:
         self.set_status("SPEAKING")
@@ -33,6 +35,14 @@ class ReminderNotifier:
             self.speak(message)
         finally:
             self.set_status("IDLE")
+        if self.on_speech_complete is not None:
+            try:
+                self.on_speech_complete()
+            except Exception as error:
+                logger.warning(
+                    "Reminder follow-up activation failed (%s)",
+                    type(error).__name__,
+                )
 
 
 class ReminderScheduler:

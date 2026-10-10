@@ -81,7 +81,7 @@ class OrionRouter:
     )
     _time_queries = re.compile(
         r"\b(what(?:'s| is) the time|what time is it|current time|time now|"
-        r"tell me the time)\b"
+        r"tell me the time|tell me what time it is)\b"
     )
     _date_queries = re.compile(
         r"\b(what(?:'s| is) the date|what date is it|what day is it|"
@@ -133,8 +133,6 @@ class OrionRouter:
             return RouteDecision(RouteKind.ONLINE_FACTUAL_LOOKUP, "weather")
         if self._online_news.search(normalized):
             return RouteDecision(RouteKind.ONLINE_FACTUAL_LOOKUP, "news")
-        if self._online_search.search(normalized):
-            return RouteDecision(RouteKind.ONLINE_FACTUAL_LOOKUP, "web_search")
 
         if self._time_queries.search(normalized):
             return RouteDecision(RouteKind.LOCAL_TOOL, "time")
@@ -142,6 +140,8 @@ class OrionRouter:
             return RouteDecision(RouteKind.LOCAL_TOOL, "date")
         if self._system_queries.search(normalized):
             return RouteDecision(RouteKind.LOCAL_TOOL, "system_status")
+        if self._online_search.search(normalized):
+            return RouteDecision(RouteKind.ONLINE_FACTUAL_LOOKUP, "web_search")
 
         return RouteDecision(RouteKind.LLM_REASONING)
 

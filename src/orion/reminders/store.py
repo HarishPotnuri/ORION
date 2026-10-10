@@ -228,7 +228,7 @@ class SQLiteReminderStore:
         }
         with self._lock:
             self._ensure_open()
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """UPDATE reminders SET title = :title, due_at_utc = :due_at_utc,
                    timezone = :timezone, notes = :notes, recurrence = :recurrence,
                    recurrence_weekday = :recurrence_weekday
@@ -236,6 +236,8 @@ class SQLiteReminderStore:
                 {**values, "id": reminder_id},
             )
             self._connection.commit()
+            if cursor.rowcount != 1:
+                return None
         return self.get(reminder_id)
 
     def claim_due(self, reminder_id: str, now: datetime) -> Reminder | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -43,6 +44,7 @@ class VoskTranscriber:
         self._recognizer_factory = recognizer_factory
         self._model = None
         self.stop_event = stop_event or threading.Event()
+        self.last_confidence: float | None = None
 
     def warmup(self) -> None:
         self._load_model()
@@ -52,6 +54,7 @@ class VoskTranscriber:
             raise FileNotFoundError("VOSK model directory not found")
 
     def transcribe(self, pcm: bytes, *, cancel_event: threading.Event, timeout=None) -> str:
+        self.last_confidence = None
         if not pcm or cancel_event.is_set():
             return ""
         deadline = time.monotonic() + (self.settings.stt_timeout if timeout is None else timeout)
@@ -61,6 +64,7 @@ class VoskTranscriber:
 
             recognizer_factory = KaldiRecognizer
         recognizer = recognizer_factory(self._load_model(), self.settings.audio_sample_rate)
+        self._enable_word_confidence(recognizer)
         block_bytes = self.settings.audio_block_frames * 2
         for offset in range(0, len(pcm), block_bytes):
             if cancel_event.is_set():
@@ -70,7 +74,9 @@ class VoskTranscriber:
             recognizer.AcceptWaveform(pcm[offset:offset + block_bytes])
         if cancel_event.is_set():
             return ""
-        return str(json.loads(recognizer.FinalResult()).get("text", "")).strip()
+        result = json.loads(recognizer.FinalResult())
+        self.last_confidence = self._word_confidence(result)
+        return str(result.get("text", "")).strip()
 
     def close(self) -> None:
         self._model = None
@@ -94,6 +100,7 @@ class VoskTranscriber:
     def transcribe_chunks(
         self, chunks: Iterator[bytes], stop_event: _TurnStopEvent | None = None
     ) -> str:
+        self.last_confidence = None
         recognizer_factory = self._recognizer_factory
         if recognizer_factory is None:
             try:
@@ -109,6 +116,7 @@ class VoskTranscriber:
                 recognizer = recognizer_factory(
                     self._load_model(), self.settings.audio_sample_rate
                 )
+                self._enable_word_confidence(recognizer)
                 for chunk in self.vad.utterance_chunks(
                     self._until_stopped(chunks, stop_event)
                 ):
@@ -117,6 +125,7 @@ class VoskTranscriber:
                 self._close_chunks(chunks)
             result = json.loads(recognizer.FinalResult())
             transcript = str(result.get("text", "")).strip()
+            self.last_confidence = self._word_confidence(result)
             outcome = "transcribed" if transcript else "empty"
             return transcript
         finally:
@@ -125,6 +134,28 @@ class VoskTranscriber:
                 (time.perf_counter() - started_at) * 1000,
                 outcome,
             )
+
+    @staticmethod
+    def _enable_word_confidence(recognizer) -> None:
+        set_words = getattr(recognizer, "SetWords", None)
+        if callable(set_words):
+            set_words(True)
+
+    @staticmethod
+    def _word_confidence(result: object) -> float | None:
+        words = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(words, list):
+            return None
+        confidences = [
+            float(word["conf"])
+            for word in words
+            if isinstance(word, dict)
+            and isinstance(word.get("conf"), (int, float))
+            and not isinstance(word.get("conf"), bool)
+            and math.isfinite(word["conf"])
+            and 0 <= word["conf"] <= 1
+        ]
+        return min(confidences) if confidences else None
 
     def _until_stopped(
         self, chunks: Iterator[bytes], stop_event: _TurnStopEvent | None = None

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
+import time
 from typing import Any
 
 from ..config import Settings
 from ..core.contracts import ToolResult
 from ..core.policy import NetworkPolicy
 from ..llm.runtime import LocalJsonTransport
+from ._factual import factual_failure
 
 _GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -49,22 +52,30 @@ class OpenMeteoWeatherTool:
             return ToolResult("Weather lookup cancelled.", success=False)
         if timeout <= 0:
             return ToolResult("Weather lookup timed out.", success=False)
+        deadline = time.monotonic() + timeout
         try:
             geocode = self.transport.get_factual_json(
                 _GEOCODING_URL,
                 params={"name": location, "count": 1, "language": "en", "format": "json"},
                 allowed_hosts=_ALLOWED_HOSTS,
-                timeout=max(0.1, timeout / 2),
+                timeout=timeout / 2,
                 policy=self.policy,
             )
-            results = geocode.get("results")
-            if not isinstance(results, list) or not results:
+            if not isinstance(geocode, dict) or not isinstance(geocode.get("results", []), list):
+                raise ValueError("Invalid geocoding response")
+            results = geocode.get("results", [])
+            if not results:
                 return ToolResult(f"No weather location matched '{location}'.", success=False)
             place = results[0]
             latitude = self._number(place, "latitude")
             longitude = self._number(place, "longitude")
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError("Invalid geocoding coordinates")
             if cancel_event.is_set():
                 return ToolResult("Weather lookup cancelled.", success=False)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
             forecast = self.transport.get_factual_json(
                 _FORECAST_URL,
                 params={
@@ -76,13 +87,17 @@ class OpenMeteoWeatherTool:
                     "timezone": "auto",
                 },
                 allowed_hosts=_ALLOWED_HOSTS,
-                timeout=max(0.1, timeout / 2),
+                timeout=remaining,
                 policy=self.policy,
             )
+            if cancel_event.is_set():
+                return ToolResult("Weather lookup cancelled.", success=False)
+            if time.monotonic() >= deadline:
+                raise TimeoutError
             compact = self._compact_forecast(place, forecast)
             return ToolResult(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
         except Exception as error:
-            return ToolResult(f"Weather lookup failed ({type(error).__name__}).", success=False)
+            return factual_failure("Weather lookup", "Open-Meteo", error)
 
     @staticmethod
     def _location_from_query(query: str) -> str:
@@ -91,23 +106,42 @@ class OpenMeteoWeatherTool:
 
     @staticmethod
     def _number(source: dict[str, Any], key: str) -> float:
+        if not isinstance(source, dict):
+            raise ValueError("Invalid geocoding result")
         value = source.get(key)
-        if not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError("Invalid geocoding coordinates")
         return float(value)
 
     @staticmethod
     def _compact_forecast(place: dict[str, Any], forecast: dict[str, Any]) -> dict[str, object]:
+        if not isinstance(forecast, dict):
+            raise ValueError("Invalid forecast response")
         current = forecast.get("current")
         daily = forecast.get("daily")
         if not isinstance(current, dict) or not isinstance(daily, dict):
             raise ValueError("Open-Meteo returned incomplete forecast data")
+        OpenMeteoWeatherTool._number(current, "temperature_2m")
+        if not isinstance(current.get("time"), str) or not current["time"]:
+            raise ValueError("Missing observation time")
+        dates = daily.get("time")
+        if not isinstance(dates, list) or not dates or len(dates) > 2:
+            raise ValueError("Missing forecast dates")
+        for key in ("temperature_2m_min", "temperature_2m_max"):
+            values = daily.get(key)
+            if not isinstance(values, list) or len(values) != len(dates):
+                raise ValueError("Incomplete daily temperatures")
+            for value in values:
+                OpenMeteoWeatherTool._number({key: value}, key)
         location = ", ".join(
             part for part in (str(place.get("name", "")), str(place.get("admin1", "")), str(place.get("country", ""))) if part
         )
         result: dict[str, object] = {
             "location": location,
             "timezone": forecast.get("timezone", place.get("timezone", "")),
+            "source": _FORECAST_URL,
+            "current_units": forecast.get("current_units", {}),
+            "daily_units": forecast.get("daily_units", {}),
             "current": {
                 key: current[key]
                 for key in (

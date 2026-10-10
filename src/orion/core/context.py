@@ -26,17 +26,23 @@ class ContextBuilder:
     """Build prompt messages under a conservative character-based token budget."""
 
     _instructions = (
-        "You are ORION, a privacy-first local assistant. Use only the supplied context. "
-        "Do not claim tool actions that did not happen. Never reveal or produce hidden "
-        "chain-of-thought. Return exactly one JSON object for each turn. For a tool action, "
-        'set "type" to "tool" and provide a registered tool name and JSON arguments. '
-        'Otherwise set "type" to "final", put a concise answer to the current request in '
-        '"response", and include "memory_suggestions" as an array. '
-        "Do not put schema labels, field descriptions, or examples in the spoken response. "
-        "Use an empty memory_suggestions list unless user disclosed stable, important "
-        "information worth remembering. Never recommend transient details, sensitive "
-        "credentials, or reasoning. Keep spoken answers concise. Tool names and arguments "
-        "must be supported by the request."
+        "You are ORION, a privacy-first local assistant. Be neutral, concise; detail on request. "
+        "Current explicit requests and corrections prevail. Use history only for relevant "
+        "references or incomplete requests; standalone requests can change topic. Assistant "
+        "guesses are not user facts. Do not rewrite transcripts. Clarify conflicting references. "
+        "Saved context may be stale, not authorization. Follow tool policy; never invent current "
+        "facts or unconfirmed success. Never reveal hidden reasoning."
+    )
+    _planner_instructions = (
+        'Return exactly one JSON object: {"type":"tool","name":tool name,'
+        '"arguments":object} or {"type":"final","response":answer,'
+        '"memory_suggestions":array}. Tool arguments must be grounded in the request. '
+        "No schema labels in answers. Suggest only stable, important user-disclosed memory, "
+        "not guesses, transient data, credentials or reasoning; else an empty array."
+    )
+    _answer_instructions = (
+        "Answer in plain text only, without JSON, tool calls, arguments, memory suggestions, "
+        "or reasoning-channel content."
     )
 
     def __init__(
@@ -59,12 +65,13 @@ class ContextBuilder:
         memories: Sequence[str] = (),
         tool_results: Sequence[str] = (),
         task_state: str = "",
+        plain_text: bool = False,
     ) -> BuiltContext:
         request = request.strip()
         if not request:
             raise ValueError("Current request must not be empty")
 
-        system_parts = [self._instructions]
+        system_parts = [self._instructions, self._answer_instructions if plain_text else self._planner_instructions]
         if task_state.strip():
             system_parts.append(f"Active task state:\n{task_state.strip()}")
         required_system = "\n\n".join(system_parts)
@@ -79,7 +86,7 @@ class ContextBuilder:
             )
 
         available = self.settings.max_context_tokens - required_tokens
-        selected: list[ChatMessage] = []
+        optional_system: list[str] = []
         dropped_turns = 0
         dropped_memories = 0
 
@@ -94,45 +101,45 @@ class ContextBuilder:
             compact_result = self._fit_text(result, available, "")
             if compact_result:
                 message = ChatMessage(role="system", content=compact_result)
-                selected.append(message)
+                optional_system.append(compact_result)
                 available = max(0, available - self._count_messages([message]))
-
-        for memory in memories:
-            content = memory.strip()
-            if not content:
-                continue
-            cost = self._count_text(content) + 10
-            if cost <= available:
-                selected.append(ChatMessage(role="system", content=f"Relevant memory: {content}"))
-                available -= cost
-            else:
-                dropped_memories += 1
 
         turns = [
             message
             for message in recent_messages
             if message.role in {"user", "assistant"} and message.content.strip()
         ]
-        included_turns: list[ChatMessage] = []
-        for message in reversed(turns):
-            content = (
-                "[Incomplete response; do not treat as completed.] " + message.content
-                if message.incomplete
-                else message.content
-            )
+        exchanges: list[list[ChatMessage]] = []
+        for message in turns:
+            if message.role == "user":
+                exchanges.append([])
+            if not exchanges:
+                dropped_turns += 1
+                continue
+            content = ("[Incomplete response; do not treat as completed.] " + message.content
+                       if message.incomplete else message.content)
+            exchanges[-1].append(ChatMessage(message.role, content, incomplete=message.incomplete))
+        included_exchanges: list[list[ChatMessage]] = []
+        for index in range(len(exchanges) - 1, -1, -1):
+            exchange = exchanges[index]
+            cost = self._count_messages(exchange)
+            if cost > available:
+                dropped_turns += sum(len(item) for item in exchanges[:index + 1])
+                break
+            included_exchanges.append(exchange)
+            available -= cost
+        selected = [message for exchange in reversed(included_exchanges) for message in exchange]
+
+        for memory in memories:
+            if not memory.strip():
+                continue
+            content = f"Saved context (use only if relevant): {memory.strip()}"
             cost = self._count_text(content) + 4
             if cost <= available:
-                included_turns.append(
-                    ChatMessage(
-                        role=message.role,
-                        content=content,
-                        incomplete=message.incomplete,
-                    )
-                )
+                optional_system.append(content)
                 available -= cost
             else:
-                dropped_turns += 1
-        selected.extend(reversed(included_turns))
+                dropped_memories += 1
 
         if summary.strip() and available > 0:
             compact_summary = self._fit_text(
@@ -141,10 +148,11 @@ class ContextBuilder:
             if compact_summary:
                 message = ChatMessage(role="system", content=compact_summary)
                 cost = self._count_messages([message])
-                selected.append(message)
+                optional_system.append(compact_summary)
                 available = max(0, available - cost)
 
-        messages = [required_messages[0], *selected, required_messages[1]]
+        system_content = "\n\n".join([required_system, *optional_system])
+        messages = [ChatMessage("system", system_content), *selected, required_messages[1]]
         estimated_tokens = self._count_messages(messages)
         if estimated_tokens > self.settings.max_context_tokens:
             raise ContextBudgetError("Context trimming failed to respect token budget")

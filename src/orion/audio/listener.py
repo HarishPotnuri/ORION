@@ -51,7 +51,11 @@ class WakeListenerInput:
         self._active_turn = None
         self._turn_phase = "idle"
         self._turn_deadline = float("inf")
+        self._turn_start_deadline = float("inf")
+        self._turn_followup = False
+        self._followup_until = 0.0
         self._turn_cancel = threading.Event()
+        self._last_transcription_confidence: float | None = None
         self._control_cancel = self.control.cancel_event
         self._turn_token = None
         self._pending_barge_in = None
@@ -81,6 +85,10 @@ class WakeListenerInput:
             self._turn_cancel.set()
             self._active_turn = None
             self._turn_phase = "idle"
+            self._turn_deadline = float("inf")
+            self._turn_start_deadline = float("inf")
+            self._turn_followup = False
+            self._followup_until = 0.0
             self._armed.clear()
         self._clear_results()
         self._pending_barge_in = None
@@ -112,7 +120,16 @@ class WakeListenerInput:
                 while not session.is_set():
                     with self._turn_lock:
                         active_turn = self._active_turn
-                        deadline = self._turn_deadline
+                        deadline = (
+                            self._turn_start_deadline
+                            if self._turn_phase == "listening"
+                            else self._turn_deadline
+                        )
+                        followup_turn = (
+                            active_turn is not None
+                            and self._turn_phase == "listening"
+                            and self._turn_followup
+                        )
                     if active_turn is not None and time.monotonic() >= deadline:
                         self._finish_turn(active_turn)
                         continue
@@ -137,7 +154,11 @@ class WakeListenerInput:
                         wake_frame = bytes(frame[:2560])
                         del frame[:2560]
                         started = time.monotonic()
-                        detected = self.detector.detected(wake_frame)
+                        detected = (
+                            self.vad._rms(wake_frame) >= self.vad.threshold
+                            if followup_turn
+                            else self.detector.detected(wake_frame)
+                        )
                         with self._turn_lock:
                             still_armed = (
                                 active_turn is not None
@@ -158,10 +179,13 @@ class WakeListenerInput:
                         if detected:
                             activated = still_armed or barge_in
                             if activated:
-                                logger.info("Wake word detected")
+                                logger.info(
+                                    "Follow-up speech detected"
+                                    if followup_turn else "Wake word detected"
+                                )
                                 if barge_in:
                                     self.gate.request_interrupt()
-                                if self.on_wake is not None:
+                                if not followup_turn and self.on_wake is not None:
                                     self.on_wake()
                             break
                     if not activated:
@@ -182,7 +206,13 @@ class WakeListenerInput:
                             if self._active_turn != active_turn or self._turn_phase != "listening":
                                 continue
                             self._turn_phase = "capturing"
-                            turn_deadline = self._turn_deadline
+                            turn_deadline = (
+                                time.monotonic()
+                                + self.settings.max_utterance_seconds
+                                + 2
+                                if followup_turn else self._turn_deadline
+                            )
+                            self._turn_deadline = turn_deadline
                             turn_cancel = self._turn_cancel
                     frame.clear()
                     turn_stop = _Cancelled(
@@ -191,6 +221,12 @@ class WakeListenerInput:
                     )
 
                     def speech_chunks():
+                        if followup_turn:
+                            block_bytes = self.settings.audio_block_frames * 2
+                            for offset in range(0, len(wake_frame), block_bytes):
+                                if turn_stop.is_set():
+                                    return
+                                yield wake_frame[offset:offset + block_bytes]
                         for speech in chunks:
                             if turn_stop.is_set():
                                 break
@@ -261,15 +297,19 @@ class WakeListenerInput:
                 self._turn_cancel.set()
                 self._active_turn = None
                 self._turn_phase = "idle"
+                self._turn_deadline = float("inf")
+                self._turn_start_deadline = float("inf")
+                self._turn_followup = False
                 self._armed.clear()
 
-    def next_utterance(self, timeout=None) -> str:
+    def next_utterance(self, timeout=None, *, followup: bool = False) -> str:
         with self._call_lock:
             if self.stop_event.is_set():
                 return ""
             self.start()
             self._clear_results()
             self._turn_token = None
+            self._last_transcription_confidence = None
             deadline = float("inf") if timeout is None else time.monotonic() + timeout
             pending_barge_in = self._pending_barge_in
             self._pending_barge_in = None
@@ -281,7 +321,7 @@ class WakeListenerInput:
                 remaining = min(self.settings.stt_timeout, deadline - time.monotonic())
                 if remaining <= 0:
                     return ""
-                text = self.transcriber.transcribe(
+                text = self._transcribe(
                     pcm,
                     cancel_event=_Cancelled(self.stop_event, captured_cancel, deadline=deadline),
                     timeout=remaining,
@@ -295,16 +335,28 @@ class WakeListenerInput:
                 turn_id = self._turn_sequence
                 self._active_turn = turn_id
                 self._turn_phase = "listening"
+                pending_followup = self._followup_until > time.monotonic()
+                followup_turn = followup or pending_followup
+                if pending_followup:
+                    deadline = min(deadline, self._followup_until)
+                    self._followup_until = 0.0
+                self._turn_followup = followup_turn
                 self._turn_deadline = deadline
+                self._turn_start_deadline = deadline
                 self._turn_cancel = threading.Event()
                 self._control_cancel = self.control.cancel_event
                 turn_cancel = self._turn_cancel
                 control_cancel = self._control_cancel
                 self._armed.set()
             try:
-                while not self.stop_event.is_set() and time.monotonic() < deadline:
+                while not self.stop_event.is_set():
+                    with self._turn_lock:
+                        deadline = self._turn_deadline
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return ""
                     try:
-                        result = self._results.get(timeout=0.05)
+                        result = self._results.get(timeout=min(0.05, remaining))
                     except queue.Empty:
                         continue
                     result_turn, *payload = result
@@ -321,7 +373,7 @@ class WakeListenerInput:
                     if remaining <= 0:
                         return ""
                     started = time.monotonic()
-                    text = self.transcriber.transcribe(
+                    text = self._transcribe(
                         pcm,
                         cancel_event=_Cancelled(
                             self.stop_event, captured_cancel, captured_turn_cancel,
@@ -337,6 +389,35 @@ class WakeListenerInput:
                 return ""
             finally:
                 self._finish_turn(turn_id)
+
+    def next_followup_utterance(self, timeout: float = 10.0) -> str:
+        return self.next_utterance(timeout=timeout, followup=True)
+
+    def _transcribe(self, pcm, *, cancel_event, timeout) -> str:
+        text = self.transcriber.transcribe(
+            pcm, cancel_event=cancel_event, timeout=timeout
+        )
+        self._last_transcription_confidence = getattr(
+            self.transcriber, "last_confidence", None
+        )
+        return text
+
+    @property
+    def transcription_confidence(self) -> float | None:
+        return self._last_transcription_confidence
+
+    def open_followup_window(self, timeout: float = 10.0) -> None:
+        if timeout <= 0 or self.stop_event.is_set() or self.control.muted:
+            return
+        deadline = time.monotonic() + timeout
+        with self._turn_lock:
+            if self._active_turn is not None and self._turn_phase == "listening":
+                self._turn_followup = True
+                self._turn_deadline = deadline
+                self._turn_start_deadline = deadline
+                self._followup_until = 0.0
+            else:
+                self._followup_until = deadline
 
     def claim_utterance(self) -> bool:
         token = self._turn_token

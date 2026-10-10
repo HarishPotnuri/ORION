@@ -52,7 +52,7 @@ class AudioInput(Protocol):
 
 
 class SpeechOutput(Protocol):
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> bool | None:
         """Speak text using a local speech engine."""
 
 

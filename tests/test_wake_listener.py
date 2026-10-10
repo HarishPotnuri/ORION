@@ -3,6 +3,7 @@ import hashlib
 import json
 import queue
 import threading
+import time
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -290,8 +291,12 @@ class ListenerHarness:
         self.wake_events = []
         self.calls = []
 
-    def request(self, timeout=1):
-        call = BackgroundCall(lambda: self.listener.next_utterance(timeout=timeout))
+    def request(self, timeout=1, *, followup=False):
+        call = BackgroundCall(
+            lambda: self.listener.next_utterance(
+                timeout=timeout, followup=followup
+            )
+        )
         self.calls.append(call)
         assert self.listener._armed.wait(WAIT), "Consumer did not arm listener"
         return call
@@ -374,6 +379,45 @@ def test_wake_voiced_turn_transcribes_raw_pcm_once_and_claims_once(harness):
     assert harness.listener.claim_utterance()
     assert harness.wake_events == ["LISTENING"]
     assert not harness.listener.claim_utterance()
+
+
+def test_followup_speech_uses_vad_without_wakeword(harness):
+    call = harness.request(followup=True)
+    session = harness.source.next_session()
+    blocks = [pcm(1000), pcm(1200), pcm(0), pcm(0)]
+    session.feed(*blocks)
+
+    assert call.result() == "recognized words"
+    assert harness.transcriber.calls[0][0] == b"".join(blocks)
+    assert harness.detector.frames == []
+    assert harness.listener.claim_utterance()
+
+
+def test_reminder_followup_window_switches_active_listener(harness):
+    call = harness.request(timeout=1)
+    session = harness.source.next_session()
+    harness.listener.open_followup_window(timeout=1)
+    blocks = [pcm(1000), pcm(1200), pcm(0), pcm(0)]
+    session.feed(*blocks)
+
+    assert call.result() == "recognized words"
+    assert harness.transcriber.calls[0][0] == b"".join(blocks)
+    assert harness.detector.frames == []
+    assert harness.listener.claim_utterance()
+
+
+def test_followup_start_deadline_does_not_bound_utterance_capture(harness):
+    harness.transcriber.release.clear()
+    started = time.monotonic()
+    call = harness.request(timeout=0.1, followup=True)
+    session = harness.source.next_session()
+    session.feed(pcm(1000), pcm(1200), pcm(0), pcm(0))
+
+    assert harness.transcriber.entered.wait(WAIT)
+    assert harness.listener._turn_deadline > started + 0.5
+    harness.transcriber.release.set()
+    assert call.result() == "recognized words"
+    assert harness.listener.claim_utterance()
 
 
 def test_worker_detects_while_transcription_and_model_consumer_are_busy(harness):

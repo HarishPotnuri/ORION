@@ -7,7 +7,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +40,7 @@ class AgentResult:
     completed: bool
     reason: str
     memory_suggestions: tuple[MemorySuggestion, ...] = ()
+    tool_observations: tuple[str, ...] = ()
 
 
 class _VisibleTextFilter:
@@ -124,7 +125,7 @@ class AgentController:
         self,
         request: str,
         *,
-        recent_messages: Sequence[ChatMessage] = (),
+        recent_messages: Sequence[ChatMessage] | None = None,
         memories: Sequence[str] = (),
         summary: str = "",
         initial_observations: Sequence[str] = (),
@@ -138,8 +139,10 @@ class AgentController:
             return AgentResult("Please say what you need.", 0, False, "empty_request")
 
         if self.memory is not None:
-            recent_messages = self.memory.recent_messages(8)
+            if recent_messages is None:
+                recent_messages = self.memory.recent_messages(self.settings.memory_recent_message_limit)
             memories = self.memory.search(request, limit=5)
+        recent_messages = recent_messages or ()
 
         started = self._clock()
         if timeout is not None and timeout <= 0:
@@ -241,7 +244,7 @@ class AgentController:
                 suggestions = decision["memory_suggestions"]
                 if save_memory_suggestions:
                     self._save_memory_suggestions(suggestions)
-                return AgentResult(response, step, True, "completed", suggestions)
+                return AgentResult(response, step, True, "completed", suggestions, tuple(tool_results))
 
             name = decision["name"]
             arguments = decision["arguments"]
@@ -309,7 +312,7 @@ class AgentController:
         self,
         request: str,
         *,
-        recent_messages: Sequence[ChatMessage] = (),
+        recent_messages: Sequence[ChatMessage] | None = None,
         memories: Sequence[str] = (),
         summary: str = "",
         initial_task_state: str = "No tool action has run.",
@@ -327,8 +330,10 @@ class AgentController:
             yield ModelStreamEvent(kind="failed", error="empty_request")
             return
         if self.memory is not None:
-            recent_messages = self.memory.recent_messages(8)
+            if recent_messages is None:
+                recent_messages = self.memory.recent_messages(self.settings.memory_recent_message_limit)
             memories = self.memory.search(request, limit=5)
+        recent_messages = recent_messages or ()
 
         suggestions: tuple[MemorySuggestion, ...] = ()
         plan_result: AgentResult | None = None
@@ -356,7 +361,7 @@ class AgentController:
             suggestions = plan_result.memory_suggestions
             initial_task_state = (
                 f"Planning completed with status {plan_result.reason}. "
-                f"Authoritative task outcome: {plan_result.response}"
+                f"Planner answer (interpretation, not tool evidence): {plan_result.response}"
             )
 
         try:
@@ -366,24 +371,15 @@ class AgentController:
                 summary=summary,
                 memories=memories,
                 task_state=initial_task_state,
+                tool_results=plan_result.tool_observations if plan_result is not None else (),
+                plain_text=True,
             )
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise TimeoutError("Task deadline expired before streamed generation")
             if cancellation.is_set():
                 raise RuntimeError("Request was cancelled")
-            system_message = ChatMessage(
-                role="system",
-                content=(
-                    "You are ORION, a privacy-first local assistant. Answer the current user "
-                    "request in concise plain text. Use only supplied context and authoritative "
-                    "task outcomes. Never reveal reasoning. Never emit JSON, tool calls, tool "
-                    "arguments, memory suggestions, or reasoning-channel content. Do not claim "
-                    "an action succeeded unless supplied task outcome confirms success.\n\n"
-                    + initial_task_state
-                ),
-            )
-            messages = (system_message, *context.messages[1:])
+            messages = context.messages
             visible_filter = _VisibleTextFilter()
             delivered: list[str] = []
             completed = False

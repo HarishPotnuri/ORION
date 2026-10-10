@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -94,20 +94,60 @@ class RequestOrchestrator:
         if decision.kind == RouteKind.MEMORY_DELETE and decision.action == "clear_conversation":
             return result
         if self.memory is not None and request.strip() and result.response.strip():
-            self.memory.add_turn(request, result.response)
+            if result.completed or (
+                decision.kind == RouteKind.LLM_REASONING
+                and self.capabilities.assess(request).supported
+            ):
+                self.memory.add_turn(
+                    request, result.response, assistant_incomplete=not result.completed
+                )
         return result
 
     def stream(
-        self, request: str, *, cancel_event: threading.Event | None = None
+        self,
+        request: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        delivered_text: list[str] | None = None,
     ) -> Iterator[ModelStreamEvent]:
         decision = self.router.route(request)
         if decision.kind != RouteKind.LLM_REASONING:
-            result = self.handle(request)
-            yield ModelStreamEvent(kind="text", text=result.response)
-            yield ModelStreamEvent(
-                kind="completed",
-                finish_reason="stop" if result.completed else "rejected",
-            )
+            if delivered_text is None:
+                result = self.handle(request)
+                yield ModelStreamEvent(kind="text", text=result.response)
+                yield ModelStreamEvent(
+                    kind="completed",
+                    finish_reason="stop" if result.completed else "rejected",
+                )
+                return
+            result = self._dispatch(request, decision)
+            stream_completed = False
+            try:
+                yield ModelStreamEvent(kind="text", text=result.response)
+                yield ModelStreamEvent(
+                    kind="completed",
+                    finish_reason="stop" if result.completed else "rejected",
+                )
+                stream_completed = True
+            finally:
+                if (
+                    self.memory is not None
+                    and request.strip()
+                    and result.response.strip()
+                    and result.completed
+                    and not (
+                        decision.kind == RouteKind.MEMORY_DELETE
+                        and decision.action == "clear_conversation"
+                    )
+                ):
+                    self.memory.add_turn(
+                        request,
+                        " ".join(delivered_text),
+                        assistant_incomplete=(
+                            not stream_completed
+                            or bool(cancel_event and cancel_event.is_set())
+                        ),
+                    )
             return
         capability = self.capabilities.assess(request)
         if not capability.supported:
@@ -118,8 +158,8 @@ class RequestOrchestrator:
 
         agent, task_state, allowed_names = self._create_planner_agent(request)
         started = time.monotonic()
-        delivered: list[str] = []
-        recorded = False
+        generated: list[str] = []
+        failed = False
         completed = False
         try:
             for event in agent.stream(
@@ -129,33 +169,63 @@ class RequestOrchestrator:
                 cancel_event=cancel_event,
             ):
                 if event.kind == "text":
-                    delivered.append(event.text)
+                    generated.append(event.text)
                 elif event.kind == "completed":
                     completed = True
                 if event.kind == "failed":
-                    if self.memory is not None:
-                        self.memory.add_turn(
-                            request,
-                            "".join(delivered),
-                            assistant_incomplete=True,
-                        )
-                        recorded = True
-                elif event.kind == "completed" and self.memory is not None:
-                    self.memory.add_turn(request, "".join(delivered))
-                    recorded = True
+                    failed = True
                 yield event
         finally:
-            if not recorded and self.memory is not None:
+            if self.memory is not None:
                 self.memory.add_turn(
                     request,
-                    "".join(delivered),
-                    assistant_incomplete=True,
+                    " ".join(delivered_text) if delivered_text is not None else "".join(generated),
+                    assistant_incomplete=(
+                        not completed
+                        or failed
+                        or bool(cancel_event and cancel_event.is_set())
+                    ),
                 )
         logger.info(
             "Streamed planner finished completed=%s elapsed_ms=%.1f",
             completed,
             (time.monotonic() - started) * 1000,
         )
+
+    def suggest_transcript_correction(self, transcript: str) -> str | None:
+        repair_settings = replace(self.settings, max_agent_steps=1)
+        agent = AgentController(
+            repair_settings,
+            self.model,
+            {},
+            context_builder=self.context_builder,
+            memory=self.memory,
+        )
+        result = agent.run(
+            f"Review this uncertain voice transcript:\n{transcript}",
+            initial_task_state=(
+                "This is a transcript-recovery suggestion only. Use recent user context only "
+                "when it strongly supports a minimal correction. Preserve negation, names, "
+                "numbers, and intent. Do not add actions or details. Do not use tools. "
+                "Reply exactly UNCERTAIN, or CORRECTION: followed by the full corrected transcript."
+            ),
+            allowed_tool_names=(),
+            timeout=min(
+                self.settings.max_tool_execution_time,
+                self.settings.max_total_task_time,
+            ),
+            save_memory_suggestions=False,
+        )
+        if not result.completed:
+            return None
+        response = result.response.strip()
+        match = re.fullmatch(r"(?is)CORRECTION:\s*(.{1,300})", response)
+        if match is None:
+            return None
+        correction = match.group(1).strip()
+        if not correction or correction.casefold() == transcript.strip().casefold():
+            return None
+        return correction
 
     def _dispatch(self, request: str, decision: RouteDecision) -> RequestResult:
         if decision.kind == RouteKind.INCOGNITO:

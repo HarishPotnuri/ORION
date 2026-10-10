@@ -80,6 +80,7 @@ class Settings:
     stt_language: str = "en"
     stt_threads: int = 2
     stt_timeout: float = 30.0
+    stt_confidence_threshold: float = 0.55
     whisper_cli_path: str = "whisper-cli"
     tts_backend: str = "kittentts"
     tts_threads: int = 2
@@ -259,6 +260,7 @@ class Settings:
             stt_language=os.getenv("ORION_STT_LANGUAGE", "en").lower(),
             stt_threads=_env_int("STT_THREADS", 2),
             stt_timeout=_env_float("STT_TIMEOUT", 30.0),
+            stt_confidence_threshold=_env_float("STT_CONFIDENCE_THRESHOLD", 0.55),
             whisper_cli_path=os.getenv("ORION_WHISPER_CLI_PATH", "whisper-cli"),
             tts_backend=tts_backend,
             tts_threads=_env_int("TTS_THREADS", 2),
@@ -366,6 +368,11 @@ class Settings:
             raise ValueError("ORION_STT_LANGUAGE must be a language code or 'auto'")
         if self.stt_threads < 1 or self.wake_word_threads < 1:
             raise ValueError("ORION STT and wake-word threads must be positive")
+        if (
+            not math.isfinite(self.stt_confidence_threshold)
+            or not 0 <= self.stt_confidence_threshold <= 1
+        ):
+            raise ValueError("ORION_STT_CONFIDENCE_THRESHOLD must be between 0 and 1")
         if (
             not math.isfinite(self.stt_timeout)
             or not math.isfinite(self.microphone_button_debounce)

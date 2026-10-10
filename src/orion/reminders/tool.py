@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from zoneinfo import ZoneInfo
 
@@ -36,9 +38,11 @@ class ReminderTool:
         self.request = " ".join(request.casefold().split())
 
     def execute(self, arguments, *, timeout: float, cancel_event: threading.Event) -> ToolResult:
-        del timeout
-        if cancel_event.is_set():
-            return ToolResult("Reminder action cancelled.", success=False)
+        deadline = time.monotonic() + timeout
+        check_active = lambda: self._check_active(deadline, cancel_event)
+        inactive = check_active()
+        if inactive is not None:
+            return inactive
         try:
             values = self._validate_arguments(arguments)
             action = values["action"]
@@ -48,7 +52,7 @@ class ReminderTool:
                 reminders = self.manager.list(status=ReminderStatus.PENDING)[:10]
                 return ToolResult(self._serialize(reminders))
             if action == "create":
-                return self._create(values)
+                return self._create(values, check_active)
             query = values.get("query", "")
             reminder = self._resolve(query)
             if isinstance(reminder, ToolResult):
@@ -65,6 +69,9 @@ class ReminderTool:
                     )
                     if not self.confirm_action(prompt):
                         return ToolResult("Reminder cancellation was not confirmed.", success=False)
+                inactive = check_active()
+                if inactive is not None:
+                    return inactive
                 cancelled = self.manager.cancel(reminder.id)
                 return ToolResult(
                     "Reminder cancelled." if cancelled else "Reminder is no longer pending.",
@@ -76,13 +83,26 @@ class ReminderTool:
                     return ToolResult("Specify reminder notes to add.", success=False)
                 if not self._appears_in_request(notes):
                     return ToolResult("Reminder notes must come from the user's request.", success=False)
+                inactive = check_active()
+                if inactive is not None:
+                    return inactive
                 updated = self.manager.update(reminder.id, notes=notes)
                 return ToolResult("Reminder notes updated." if updated else "Reminder update failed.", success=updated is not None)
-            return self._reschedule(reminder.id, values.get("when", ""))
+            return self._reschedule(reminder.id, values.get("when", ""), check_active)
         except ValueError as error:
             return ToolResult(str(error), success=False)
+        except (sqlite3.Error, RuntimeError):
+            return ToolResult("Reminder service is unavailable. Check the reminder database and retry; the action was not confirmed successful.", success=False)
 
-    def _create(self, values: dict[str, str]) -> ToolResult:
+    @staticmethod
+    def _check_active(deadline: float, cancel_event: threading.Event) -> ToolResult | None:
+        if cancel_event.is_set():
+            return ToolResult("Reminder action cancelled.", success=False)
+        if time.monotonic() >= deadline:
+            return ToolResult("Reminder action timed out. List reminders before retrying a change.", success=False)
+        return None
+
+    def _create(self, values: dict[str, str], check_active: Callable[[], ToolResult | None]) -> ToolResult:
         title = values.get("title", "").strip()
         when = values.get("when", "").strip()
         if not title or not when:
@@ -101,15 +121,21 @@ class ReminderTool:
             recurrence_weekday=weekday,
             notes=notes,
         )
+        inactive = check_active()
+        if inactive is not None:
+            return inactive
         reminder = self.manager.create(parsed, original_request=self.original_request)
         return ToolResult(self._serialize([reminder]))
 
-    def _reschedule(self, reminder_id: str, when: str) -> ToolResult:
+    def _reschedule(self, reminder_id: str, when: str, check_active: Callable[[], ToolResult | None]) -> ToolResult:
         if not when:
             return ToolResult("Specify the new reminder time.", success=False)
         if not self._appears_in_request(when):
             return ToolResult("New reminder time must come from the user's request.", success=False)
         due_at, recurrence, weekday = self.manager.parser.parse_schedule(when)
+        inactive = check_active()
+        if inactive is not None:
+            return inactive
         updated = self.manager.update(
             reminder_id,
             due_at=due_at,

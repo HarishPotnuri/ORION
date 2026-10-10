@@ -234,6 +234,16 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be positive"):
                     Settings.from_environment()
 
+    def test_stt_confidence_threshold_must_be_between_zero_and_one(self) -> None:
+        with self.clean_environment({"ORION_STT_CONFIDENCE_THRESHOLD": "0.63"}):
+            self.assertEqual(Settings.from_environment().stt_confidence_threshold, 0.63)
+        for value in ("-0.1", "1.1", "nan"):
+            with self.subTest(value=value), self.clean_environment(
+                {"ORION_STT_CONFIDENCE_THRESHOLD": value}
+            ):
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    Settings.from_environment()
+
     def test_rejects_invalid_reminder_timezone(self) -> None:
         with self.clean_environment({"ORION_REMINDER_TIMEZONE": "Mars/Olympus"}):
             with self.assertRaisesRegex(ValueError, "valid IANA timezone"):

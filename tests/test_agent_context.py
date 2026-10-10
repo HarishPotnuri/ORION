@@ -1,16 +1,20 @@
 import json
+import tempfile
 import threading
 import time
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from orion.config import Settings
 from orion.core.agent import AgentController
 from orion.core.context import ContextBudgetError, ContextBuilder
 from orion.core.contracts import ChatMessage, ModelStreamEvent, ToolResult
+from orion.core.orchestrator import RequestOrchestrator
 from orion.memory.manager import MemoryManager
 from orion.memory.policy import MemoryCandidate, MemorySaveStatus
 from orion.memory.store import SQLiteMemoryStore
+from orion.tools.registry import ToolRegistry
 
 
 class ScriptedModel:
@@ -126,9 +130,7 @@ class ContextBuilderTests(unittest.TestCase):
 
         self.assertIn("Conversation summary:", content)
         self.assertIn("Tool result:", content)
-        result_message = next(
-            message.content for message in context.messages if "Tool result:" in message.content
-        )
+        result_message = context.messages[0].content.split("Tool result: ", 1)[1].split("\n\n", 1)[0]
         self.assertLessEqual(len(result_message), 100)
         self.assertLessEqual(context.estimated_tokens, self.settings.max_context_tokens)
 
@@ -166,12 +168,43 @@ class ContextBuilderTests(unittest.TestCase):
         context = self.builder.build(
             "Continue",
             recent_messages=[
+                ChatMessage("user", "Explain this"),
                 ChatMessage("assistant", "A partial answer", incomplete=True)
             ],
         )
 
         prior_turn = next(message for message in context.messages if "partial answer" in message.content)
         self.assertIn("Incomplete response", prior_turn.content)
+
+    def test_trimming_keeps_contiguous_exchanges_not_orphaned_guesses(self):
+        settings = replace(self.settings, max_context_tokens=1100)
+        builder = ContextBuilder(settings, token_counter=len)
+        turns = [ChatMessage("user", "Old subject"), ChatMessage("assistant", "Old guess"),
+                 ChatMessage("user", "long request " * 100), ChatMessage("assistant", "A guess"),
+                 ChatMessage("user", "Recent subject"), ChatMessage("assistant", "Recent answer")]
+        context = builder.build("Explain it", recent_messages=turns)
+        self.assertEqual([message.content for message in context.messages[1:-1]],
+                         ["Recent subject", "Recent answer"])
+        self.assertEqual(context.dropped_turns, 4)
+
+    def test_recent_references_take_budget_priority_over_saved_context(self):
+        settings = replace(self.settings, max_context_tokens=1100)
+        builder = ContextBuilder(settings, token_counter=len)
+        context = builder.build(
+            "Explain it", recent_messages=[ChatMessage("user", "Kafka"),
+                                           ChatMessage("assistant", "An event platform")],
+            memories=["A saved preference " * 30],
+        )
+        self.assertEqual(context.messages[1].content, "Kafka")
+        self.assertEqual(context.dropped_memories, 1)
+
+    def test_orphaned_assistant_guess_is_not_prompted(self):
+        context = self.builder.build("Explain it", recent_messages=[
+            ChatMessage("assistant", "The user must mean coffee"),
+            ChatMessage("user", "Explain Kafka"),
+        ])
+        self.assertNotIn("coffee", " ".join(message.content for message in context.messages))
+        self.assertEqual(context.dropped_turns, 1)
 
 
 class AgentControllerTests(unittest.TestCase):
@@ -242,6 +275,22 @@ class AgentControllerTests(unittest.TestCase):
             "ßß",
         )
 
+    def test_stream_preserves_shared_intent_guidance_and_one_system_message(self):
+        model = StreamingModel(
+            ModelStreamEvent(kind="text", text="Kafka is a messaging system."),
+            ModelStreamEvent(kind="completed"),
+        )
+        list(self.controller(model).stream(
+            "No, explain Kafka, not coffee.",
+            recent_messages=[ChatMessage("user", "Explain coffee"),
+                             ChatMessage("assistant", "You mean coffee.")],
+            memories=["The user likes coffee."],
+        ))
+        messages = model.stream_calls[0][0]
+        self.assertEqual([message.role for message in messages].count("system"), 1)
+        self.assertIn("Current explicit requests and corrections prevail", messages[0].content)
+        self.assertEqual(messages[-1].content, "No, explain Kafka, not coffee.")
+
     def test_authorized_tool_plan_finishes_before_final_stream(self):
         class PlanAndStreamModel(ScriptedModel):
             def stream(self, messages, *, max_tokens, timeout, cancel_event):
@@ -272,6 +321,11 @@ class AgentControllerTests(unittest.TestCase):
             "The service is healthy.",
         )
         self.assertNotIn('"type":"tool"', " ".join(message.content for message in model.streamed_messages))
+        prompt = model.streamed_messages[0].content
+        self.assertIn("Tool lookup succeeded: Found compact data.", prompt)
+        self.assertIn("interpretation, not tool evidence", prompt)
+        self.assertNotIn("Authoritative task outcome", prompt)
+        self.assertEqual(sum(message.role == "system" for message in model.streamed_messages), 1)
 
     def test_preserves_planner_guidance_after_each_tool_step(self):
         model = ScriptedModel(
@@ -571,6 +625,192 @@ class AgentControllerTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(memory.list_memories(), [])
         memory.close()
+
+
+class ConversationModel(ScriptedModel):
+    def __init__(self, *responses):
+        super().__init__(*responses)
+        self.stream_calls = []
+
+    def stream(self, messages, *, max_tokens, timeout, cancel_event):
+        self.stream_calls.append((tuple(messages), max_tokens))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        yield ModelStreamEvent(kind="text", text=response)
+        yield ModelStreamEvent(kind="completed")
+
+
+class ConversationPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = Settings()
+        self.memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        self.addCleanup(self.memory.close)
+
+    def orchestrator(self, model):
+        return RequestOrchestrator(self.settings, model, ToolRegistry([]), memory=self.memory)
+
+    def test_topics_references_corrections_and_ambiguity_in_both_paths(self):
+        requests = ("Explain coffee", "Explain Kafka", "How does it work?",
+                    "No, I said Kafka, not coffee", "Compare Kafka and SQLite", "Explain that")
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                self.memory.clear_conversation()
+                responses = ["An earlier assistant guess about coffee", "Kafka moves events",
+                             "An explanation", "Understood", "A comparison", "Which one?"]
+                model = ConversationModel(*(responses if streamed else map(final, responses)))
+                orchestrator = self.orchestrator(model)
+                for request in requests:
+                    if streamed:
+                        list(orchestrator.stream(request))
+                    else:
+                        orchestrator.handle(request)
+                calls = model.stream_calls if streamed else model.calls
+                for index, (messages, _budget) in enumerate(calls):
+                    self.assertEqual(messages[-1].content, requests[index])
+                    self.assertEqual(sum(message.role == "system" for message in messages), 1)
+                    self.assertIn("Current explicit requests and corrections prevail", messages[0].content)
+                    self.assertIn("standalone requests can change topic", messages[0].content)
+                    self.assertIn("Assistant guesses are not user facts", messages[0].content)
+                    self.assertIn("Clarify conflicting references", messages[0].content)
+                    self.assertIn("Do not rewrite transcripts", messages[0].content)
+                    self.assertEqual([message.content for message in messages[1:-1]],
+                                     [text for pair in zip(requests[:index], responses[:index]) for text in pair])
+                self.assertEqual(len(self.memory.recent_messages(100)), 12)
+
+    def test_configured_history_longer_than_eight_messages_reaches_both_paths(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                self.memory.clear_conversation()
+                for index in range(6):
+                    self.memory.add_turn(f"Subject {index}", f"Answer {index}")
+                model = ConversationModel("A response" if streamed else final("A response"))
+                orchestrator = self.orchestrator(model)
+                if streamed:
+                    list(orchestrator.stream("Explain the first subject"))
+                    messages = model.stream_calls[0][0]
+                else:
+                    orchestrator.handle("Explain the first subject")
+                    messages = model.calls[0][0]
+                self.assertEqual(len(messages[1:-1]), 12)
+                self.assertEqual(messages[1].content, "Subject 0")
+
+    def test_explicit_empty_history_is_not_replaced_by_memory_history(self):
+        self.memory.add_turn("Stale topic", "Stale guess")
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                model = ConversationModel("Fresh" if streamed else final("Fresh"))
+                agent = AgentController(self.settings, model, {}, memory=self.memory)
+                if streamed:
+                    list(agent.stream("Explain Kafka", recent_messages=()))
+                    messages = model.stream_calls[0][0]
+                else:
+                    agent.run("Explain Kafka", recent_messages=())
+                    messages = model.calls[0][0]
+                self.assertEqual(len(messages), 2)
+
+    def test_buffered_failure_is_incomplete_and_not_duplicated(self):
+        model = ConversationModel("bad JSON", "bad JSON", final("Try again"))
+        orchestrator = self.orchestrator(model)
+        result = orchestrator.handle("Explain Kafka")
+        self.assertFalse(result.completed)
+        turns = self.memory.recent_messages(16)
+        self.assertEqual(len(turns), 2)
+        self.assertTrue(turns[1].incomplete)
+        orchestrator.handle("Explain it again")
+        self.assertIn("Incomplete response", model.calls[-1][0][2].content)
+        self.assertEqual(len(self.memory.recent_messages(16)), 4)
+
+    def test_rejected_requests_do_not_enter_history_or_call_model(self):
+        model = ConversationModel()
+        orchestrator = self.orchestrator(model)
+        for request in ("   ", "What is the weather in Pune?", "Predict the next ten years"):
+            for streamed in (False, True):
+                with self.subTest(request=request, streamed=streamed):
+                    if streamed:
+                        list(orchestrator.stream(request))
+                    else:
+                        orchestrator.handle(request)
+                    self.assertEqual(self.memory.recent_messages(16), ())
+        self.assertEqual(model.calls, [])
+        self.assertEqual(model.stream_calls, [])
+
+    def test_stream_close_retains_only_yielded_text_once(self):
+        model = ConversationModel("Delivered first part")
+        stream = self.orchestrator(model).stream("Explain Kafka")
+        self.assertEqual(next(stream).text, "Delivered first part")
+        stream.close()
+        turns = self.memory.recent_messages(16)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[1].content, "Delivered first part")
+        self.assertTrue(turns[1].incomplete)
+
+    def test_failure_before_text_retains_request_without_fabricated_reply(self):
+        model = ConversationModel(RuntimeError("failure"), final("Recovered"))
+        orchestrator = self.orchestrator(model)
+        events = list(orchestrator.stream("Explain Kafka"))
+        self.assertEqual(events[-1].kind, "failed")
+        self.assertEqual(self.memory.recent_messages(16), (ChatMessage("user", "Explain Kafka"),))
+        orchestrator.handle("Try again")
+        self.assertEqual(model.calls[0][0][1].content, "Explain Kafka")
+
+    def test_clear_reset_via_stream_or_buffer_does_not_record_reset_turn(self):
+        self.memory.save_explicit_request("Remember I prefer concise answers")
+        saved = self.memory.list_memories()
+        model = ConversationModel(final("Fresh buffered"), "Fresh streamed")
+        orchestrator = self.orchestrator(model)
+        self.memory.add_turn("Old topic", "Wrong guess")
+        list(orchestrator.stream("reset our conversation"))
+        self.assertEqual(self.memory.recent_messages(16), ())
+        orchestrator.handle("Explain Kafka")
+        orchestrator.handle("clear conversation history")
+        self.assertEqual(self.memory.recent_messages(16), ())
+        list(orchestrator.stream("Explain SQLite"))
+        self.assertEqual(len(model.calls[0][0]), 2)
+        self.assertEqual(len(model.stream_calls[0][0]), 2)
+        self.assertEqual(self.memory.list_memories(), saved)
+
+    def test_restart_clears_recent_context_but_preserves_saved_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(self.settings, database_path=Path(directory) / "memory.sqlite3")
+            memory = MemoryManager.from_settings(settings)
+            memory.save_explicit_request("Remember Kafka is our event platform")
+            saved = memory.list_memories()
+            memory.add_turn("Old request", "Wrong guess")
+            memory.close()
+            restarted = MemoryManager.from_settings(settings)
+            try:
+                self.assertEqual(restarted.recent_messages(16), ())
+                self.assertEqual(restarted.list_memories(), saved)
+                model = ConversationModel("Fresh")
+                orchestrator = RequestOrchestrator(settings, model, ToolRegistry([]), memory=restarted)
+                list(orchestrator.stream("Explain Kafka"))
+                self.assertEqual(len(model.stream_calls[0][0]), 2)
+                self.assertIn("Saved context (use only if relevant)", model.stream_calls[0][0][0].content)
+            finally:
+                restarted.close()
+
+    def test_incognito_keeps_volatile_references_and_blocks_persistence(self):
+        self.memory.set_incognito(True)
+        model = ConversationModel(final("Kafka", [{"kind": "fact", "content": "User uses Kafka"}]), "Details")
+        orchestrator = self.orchestrator(model)
+        orchestrator.handle("Explain Kafka")
+        list(orchestrator.stream("Explain it further"))
+        self.assertEqual(model.stream_calls[0][0][1].content, "Explain Kafka")
+        self.assertEqual(len(self.memory.recent_messages(16)), 4)
+        self.assertEqual(self.memory.list_memories(), [])
+
+    def test_bounded_retention_is_ordered_across_separate_dispatches(self):
+        self.memory.close()
+        self.memory = MemoryManager(SQLiteMemoryStore(":memory:"), max_recent_messages=6)
+        self.addCleanup(self.memory.close)
+        model = ConversationModel(*(final(f"Answer {index}") for index in range(5)), "Last")
+        for index in range(5):
+            self.orchestrator(model).handle(f"Explain topic {index}")
+        list(self.orchestrator(model).stream("Explain it further"))
+        self.assertEqual([message.content for message in model.stream_calls[0][0][1:-1]],
+                         [text for index in range(2, 5) for text in (f"Explain topic {index}", f"Answer {index}")])
+        self.assertEqual(len(self.memory.recent_messages(100)), 6)
 
 
 if __name__ == "__main__":

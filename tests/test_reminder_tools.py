@@ -3,6 +3,7 @@ import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 from orion.config import Settings
@@ -13,6 +14,33 @@ from orion.reminders.store import SQLiteReminderStore
 
 
 class ReminderToolTests(unittest.TestCase):
+    def test_expired_request_does_not_access_store(self):
+        manager = Mock()
+        result = ReminderTool(manager, "List reminders").execute(
+            {"action": "list"}, timeout=0, cancel_event=threading.Event()
+        )
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.content)
+        manager.list.assert_not_called()
+
+    def test_cancellation_during_confirmation_does_not_cancel_reminder(self):
+        manager = Mock()
+        manager.find.return_value = [Mock(
+            id="meeting", title="project meeting", timezone="Asia/Kolkata",
+            due_at=datetime(2026, 10, 10, 13, tzinfo=ZoneInfo("Asia/Kolkata")),
+        )]
+        cancelled = threading.Event()
+
+        def confirm(_prompt):
+            cancelled.set()
+            return True
+
+        result = ReminderTool(
+            manager, "Cancel project meeting reminder", confirm_action=confirm
+        ).execute({"action": "cancel", "query": "project meeting"}, timeout=1, cancel_event=cancelled)
+        self.assertFalse(result.success)
+        manager.cancel.assert_not_called()
+
     def test_agent_cannot_cancel_when_user_only_requested_list(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = ReminderManager(

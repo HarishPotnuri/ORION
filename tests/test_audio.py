@@ -111,6 +111,46 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(len(recognizers[0].chunks), 5)
             self.assertEqual(list(model_path.iterdir()), [])
 
+    def test_vosk_exposes_minimum_word_confidence_when_available(self):
+        class ConfidenceRecognizer(FakeRecognizer):
+            words_enabled = False
+
+            def SetWords(self, enabled):
+                self.words_enabled = enabled
+
+            def FinalResult(self):
+                return json.dumps({
+                    "text": "five files",
+                    "result": [
+                        {"word": "five", "conf": 0.32},
+                        {"word": "files", "conf": 0.94},
+                    ],
+                })
+
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model"
+            model_path.mkdir()
+            recognizers = []
+
+            def create_recognizer(model, sample_rate):
+                recognizer = ConfidenceRecognizer(model, sample_rate)
+                recognizers.append(recognizer)
+                return recognizer
+
+            transcriber = VoskTranscriber(
+                self.small_settings(stt_model_path=model_path),
+                model_factory=lambda _path: object(),
+                recognizer_factory=create_recognizer,
+            )
+
+            transcript = transcriber.transcribe(
+                pcm(1000, 20), cancel_event=threading.Event()
+            )
+
+        self.assertEqual(transcript, "five files")
+        self.assertTrue(recognizers[0].words_enabled)
+        self.assertEqual(transcriber.last_confidence, 0.32)
+
     def test_vosk_logs_stt_duration_and_outcome_without_transcript(self):
         with tempfile.TemporaryDirectory() as directory:
             model_path = Path(directory) / "model"

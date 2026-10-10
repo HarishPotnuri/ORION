@@ -120,9 +120,9 @@ class KittenSpeechOutput:
             self._load_engine().generate("Ready.", voice=self.settings.tts_voice)
         logger.info("KittenTTS initialized in %.2f seconds", time.perf_counter() - started)
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> bool:
         if not text.strip():
-            return
+            return True
         with self._lock, self.gate.speaking():
             audio = self._load_engine().generate(text, voice=self.settings.tts_voice)
             play = self._play
@@ -154,8 +154,7 @@ class KittenSpeechOutput:
                 audio = self._resample(
                     audio, self.settings.tts_sample_rate, sample_rate
                 )
-                self._play_interruptibly(audio, sample_rate, device, sd)
-                return
+                return self._play_interruptibly(audio, sample_rate, device, sd)
             if play is not None and wait is not None and stop is None:
                 stop = lambda: None
             if play is None or wait is None or stop is None:
@@ -189,9 +188,9 @@ class KittenSpeechOutput:
             if device is not None:
                 play_options["device"] = device
             play(audio, **play_options)
-            self._wait_for_playback(wait, stop)
+            return self._wait_for_playback(wait, stop)
 
-    def _play_interruptibly(self, audio, sample_rate: int, device, sounddevice) -> None:
+    def _play_interruptibly(self, audio, sample_rate: int, device, sounddevice) -> bool:
         samples = array.array("f", audio)
         if not len(samples):
             return
@@ -218,8 +217,9 @@ class KittenSpeechOutput:
             "TTS playback outcome=%s",
             "interrupted" if interrupted else "completed",
         )
+        return not interrupted
 
-    def _wait_for_playback(self, wait: Callable, stop: Callable) -> None:
+    def _wait_for_playback(self, wait: Callable, stop: Callable) -> bool:
         errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
 
         def wait_for_output() -> None:
@@ -232,14 +232,17 @@ class KittenSpeechOutput:
             target=wait_for_output, name="orion-tts-playback", daemon=True
         )
         waiter.start()
+        interrupted = False
         while waiter.is_alive():
             if self.gate.wait_for_interrupt(0.05):
                 stop()
+                interrupted = True
                 break
             waiter.join(0.05)
         waiter.join()
         if not errors.empty():
             raise errors.get_nowait()
+        return not interrupted
 
 
 class PiperSpeechOutput:
@@ -301,16 +304,19 @@ class PiperSpeechOutput:
         )
         return PiperVoice(session, config)
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> bool:
         if not text.strip():
-            return
+            return True
         with self._lock, self.gate.speaking():
             voice = self._load_voice()
             source_rate = int(voice.config.sample_rate)
             if source_rate < 1:
                 raise ValueError("Piper voice metadata has an invalid sample rate")
-            self._play_chunks(self._audio_chunks(voice, text, source_rate), source_rate)
+            completed = self._play_chunks(
+                self._audio_chunks(voice, text, source_rate), source_rate
+            )
             self._last_used = time.monotonic()
+            return completed
 
     def _audio_chunks(self, voice, text: str, source_rate: int) -> Iterator[tuple[array.array, int]]:
         for chunk in voice.synthesize(text):
@@ -321,7 +327,9 @@ class PiperSpeechOutput:
             samples.frombytes(chunk.audio_int16_bytes)
             yield samples, rate
 
-    def _play_chunks(self, chunks: Iterator[tuple[array.array, int]], source_rate: int) -> None:
+    def _play_chunks(
+        self, chunks: Iterator[tuple[array.array, int]], source_rate: int
+    ) -> bool:
         try:
             import sounddevice as sd
         except ImportError as error:
@@ -347,7 +355,7 @@ class PiperSpeechOutput:
 
         first_chunk = next(chunks, None)
         if first_chunk is None:
-            return
+            return not self.gate.wait_for_interrupt(0)
         stream_factory = self._output_stream_factory or sd.RawOutputStream
         stream_options = {
             "samplerate": target_rate,
@@ -383,6 +391,7 @@ class PiperSpeechOutput:
             "Piper playback outcome=%s",
             "interrupted" if interrupted else "completed",
         )
+        return not interrupted
 
     def evict_if_idle(self, timeout: float) -> bool:
         if not self._lock.acquire(blocking=False):

@@ -221,6 +221,10 @@ class RouterTests(unittest.TestCase):
             "time",
         )
         self.assertEqual(
+            self.router.route("Tell me what time it is").action,
+            "time",
+        )
+        self.assertEqual(
             self.router.route("What is today's date?").action,
             "date",
         )

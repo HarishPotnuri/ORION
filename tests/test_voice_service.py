@@ -20,6 +20,11 @@ from orion.app import (
 from orion.audio.capture import AudioGate
 from orion.audio.stt import PushToTalkInput, WakeWordInput
 from orion.config import Settings
+from orion.core.orchestrator import RequestOrchestrator
+from orion.memory.manager import MemoryManager
+from orion.memory.store import SQLiteMemoryStore
+from orion.tools.registry import ToolRegistry
+from orion.tools.time import LocalTimeTool
 
 
 class FakeRecognizer:
@@ -469,9 +474,206 @@ class VoiceServiceTests(unittest.TestCase):
         joined_logs = "\n".join(logs.output)
         self.assertIn("stage=input_total", joined_logs)
         self.assertIn("stage=orchestration", joined_logs)
-        self.assertIn("stage=tts", joined_logs)
-        self.assertNotIn("What time is it?", joined_logs)
-        self.assertNotIn("Remind me tomorrow", joined_logs)
+        self.assertIn("stage=speech_delivery", joined_logs)
+        self.assertIn("text='What time is it?'", joined_logs)
+        self.assertIn("text='Remind me tomorrow'", joined_logs)
+        self.assertIn("generated_text='reply: What time is it?'", joined_logs)
+
+    def test_voice_loop_renews_ten_second_followup_window(self):
+        stop_event = threading.Event()
+        spoken = []
+        followup_timeouts = []
+        scheduler = FakeScheduler()
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "First request"
+                stop_event.set()
+                return ""
+
+            def next_followup_utterance(self, *, timeout):
+                followup_timeouts.append(timeout)
+                return "Follow-up request"
+
+        class Orchestrator:
+            def handle(self, request):
+                return SimpleNamespace(
+                    response=f"reply: {request}",
+                    route=SimpleNamespace(kind=SimpleNamespace(value="test")),
+                    completed=True,
+                )
+
+        class SpeechOutput:
+            def speak(self, text):
+                spoken.append(text)
+                if len(spoken) == 2:
+                    stop_event.set()
+                return True
+
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), SpeechOutput(), scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(followup_timeouts, [10.0])
+        self.assertEqual(spoken, [
+            "reply: First request",
+            "reply: Follow-up request",
+        ])
+        self.assertTrue(scheduler.stopped)
+
+    def test_low_confidence_transcript_requires_confirmation_before_routing(self):
+        stop_event = threading.Event()
+        handled = []
+        suggestions = []
+        scheduler = FakeScheduler()
+
+        class AudioInput:
+            calls = 0
+
+            @property
+            def transcription_confidence(self):
+                return 0.32
+
+            def next_utterance(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Remind me to call at file PM"
+                if self.calls == 2:
+                    return "yes"
+                stop_event.set()
+                return ""
+
+            def next_followup_utterance(self, *, timeout):
+                stop_event.set()
+                return ""
+
+            def claim_utterance(self):
+                return True
+
+        class Orchestrator:
+            settings = SimpleNamespace(stt_confidence_threshold=0.55)
+
+            def suggest_transcript_correction(self, transcript):
+                suggestions.append(transcript)
+                return "Remind me to call at five PM"
+
+            def handle(self, request):
+                handled.append(request)
+                return SimpleNamespace(
+                    response="Reminder request understood.",
+                    route=SimpleNamespace(kind=SimpleNamespace(value="test")),
+                    completed=True,
+                )
+
+        class SpeechOutput:
+            def speak(self, _text):
+                return True
+
+        with self.assertLogs("orion.app", level="INFO") as logs:
+            _run_voice_loop(
+                AudioInput(), Orchestrator(), SpeechOutput(), scheduler,
+                stop_event, lambda _status: None,
+            )
+
+        self.assertEqual(suggestions, ["Remind me to call at file PM"])
+        self.assertEqual(handled, ["Remind me to call at five PM"])
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("original='Remind me to call at file PM'", joined_logs)
+        self.assertIn("corrected='Remind me to call at five PM' confirmed=true", joined_logs)
+
+    def test_unclear_rejected_correction_gets_one_retry_then_stops(self):
+        stop_event = threading.Event()
+        handled = []
+        scheduler = FakeScheduler()
+
+        class AudioInput:
+            calls = 0
+
+            @property
+            def transcription_confidence(self):
+                return 0.2
+
+            def next_utterance(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return "Remind me to call at file PM"
+                if self.calls == 2:
+                    return "no"
+                stop_event.set()
+                return "unclear words"
+
+            def next_followup_utterance(self, *, timeout):
+                stop_event.set()
+                return ""
+
+            def claim_utterance(self):
+                return True
+
+        class Orchestrator:
+            settings = SimpleNamespace(stt_confidence_threshold=0.55)
+
+            def suggest_transcript_correction(self, _transcript):
+                return "Remind me to call at five PM"
+
+            def handle(self, request):
+                handled.append(request)
+                raise AssertionError("Unconfirmed transcript must not be routed")
+
+        class SpeechOutput:
+            def speak(self, _text):
+                return True
+
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), SpeechOutput(), scheduler,
+            stop_event, lambda _status: None,
+        )
+
+        self.assertEqual(handled, [])
+
+    def test_incognito_voice_turn_still_logs_full_transcript_and_answer(self):
+        stop_event = threading.Event()
+        settings = Settings()
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        memory.set_incognito(True)
+        orchestrator = RequestOrchestrator(
+            settings,
+            object(),
+            ToolRegistry([LocalTimeTool(settings)]),
+            memory=memory,
+        )
+
+        class AudioInput:
+            calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "What time is it?"
+                stop_event.set()
+                return ""
+
+        class SpeechOutput:
+            def speak(self, _text):
+                return True
+
+        try:
+            with self.assertLogs("orion.app", level="INFO") as logs:
+                _run_voice_loop(
+                    AudioInput(), orchestrator, SpeechOutput(), FakeScheduler(),
+                    stop_event, lambda _status: None,
+                )
+        finally:
+            memory.close()
+
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("text='What time is it?'", joined_logs)
+        self.assertIn("Voice response turn=1 generated_text=", joined_logs)
+        self.assertIn(" IST'", joined_logs)
 
     def test_streamed_voice_speaks_first_phrase_before_generation_finishes(self):
         stop_event = threading.Event()
@@ -550,14 +752,18 @@ class VoiceServiceTests(unittest.TestCase):
                 gate.request_interrupt()
 
         output = _StatusSpeechOutput(Adapter(), lambda _status: None, gate)
-        _run_voice_loop(
-            AudioInput(), Orchestrator(), output, scheduler,
-            stop_event, lambda _status: None,
-        )
+        with self.assertLogs("orion.app", level="INFO") as logs:
+            _run_voice_loop(
+                AudioInput(), Orchestrator(), output, scheduler,
+                stop_event, lambda _status: None,
+            )
 
         self.assertEqual(spoken, ["First."])
         self.assertEqual(cancellations, [True])
         self.assertTrue(gate.is_open)
+        joined_logs = "\n".join(logs.output)
+        self.assertIn("generated_text='First. Unsaid tail'", joined_logs)
+        self.assertIn("delivered_text='' outcome=interrupted", joined_logs)
 
     def test_gpio_interrupt_cancels_generation_before_first_phrase(self):
         stop_event = threading.Event()

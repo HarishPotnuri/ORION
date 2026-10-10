@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import ParsedReminder
@@ -72,6 +72,33 @@ class ReminderParser:
             raise ValueError("now must be timezone-aware")
         current = current.astimezone(self.timezone)
 
+        times = list(self._time_pattern.finditer(original))
+        relatives = list(self._relative_pattern.finditer(original))
+        if len(times) > 1 or len(relatives) > 1 or (times and relatives):
+            raise ReminderParseError("Specify one reminder time; the schedule is ambiguous")
+        if re.search(
+            r"\b(?:today|tomorrow|tmrw|tmr|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+or\s+"
+            r"(?:today|tomorrow|tmrw|tmr|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            original, re.IGNORECASE,
+        ):
+            raise ReminderParseError("Specify one reminder day; the schedule is ambiguous")
+        if times:
+            suffix = original[times[0].end():]
+            explicit_zone = re.match(
+                r"\s*(IST|UTC|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT|[A-Za-z_]+/[A-Za-z_]+)\b",
+                suffix, re.IGNORECASE,
+            )
+            if explicit_zone:
+                requested = explicit_zone.group(1).casefold()
+                compatible = {
+                    "ist": {"Asia/Kolkata", "Asia/Calcutta"},
+                    "utc": {"UTC", "Etc/UTC", "Etc/GMT", "GMT"},
+                    "gmt": {"UTC", "Etc/UTC", "Etc/GMT", "GMT"},
+                }.get(requested, {explicit_zone.group(1)})
+                if self.timezone_name not in compatible:
+                    raise ReminderParseError(
+                        f"Use the configured reminder timezone ({self.timezone_name}); the requested timezone is not supported"
+                    )
         relative = self._relative_pattern.search(original)
         if relative:
             due_at = self._relative_due(relative, current)
@@ -106,6 +133,8 @@ class ReminderParser:
     @staticmethod
     def _relative_due(match: re.Match, current: datetime) -> datetime:
         amount = int(match.group("amount"))
+        if amount <= 0:
+            raise ReminderParseError("Specify a positive future reminder delay")
         unit = match.group("unit").casefold()
         if unit.startswith("minute"):
             delta = timedelta(minutes=amount)
@@ -113,7 +142,8 @@ class ReminderParser:
             delta = timedelta(hours=amount)
         else:
             delta = timedelta(days=amount)
-        return current + delta
+            return current + delta
+        return (current.astimezone(UTC) + delta).astimezone(current.tzinfo)
 
     def _calendar_due(
         self, request: str, current: datetime

@@ -173,6 +173,71 @@ class LocalToolTests(unittest.TestCase):
         self.assertEqual(sum(message.role == "assistant" for message in messages), 1)
         memory.close()
 
+    def test_interrupted_voice_stream_records_only_reported_delivery(self):
+        request = "Explain Kafka briefly"
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        model = ScriptedStreamingModel(
+            ModelStreamEvent(kind="text", text="Kafka moves events. Unsaid tail."),
+            ModelStreamEvent(kind="completed", finish_reason="stop"),
+        )
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([]), memory=memory
+        )
+        delivered_text = []
+        cancel_event = threading.Event()
+        stream = orchestrator.stream(
+            request,
+            cancel_event=cancel_event,
+            delivered_text=delivered_text,
+        )
+
+        self.assertEqual(next(stream).text, "Kafka moves events. Unsaid tail.")
+        delivered_text.append("Kafka moves events.")
+        delivered_text.append("More facts.")
+        cancel_event.set()
+        stream.close()
+        assistant = next(
+            message for message in memory.recent_messages(8)
+            if message.role == "assistant"
+        )
+
+        self.assertEqual(assistant.content, "Kafka moves events. More facts.")
+        self.assertTrue(assistant.incomplete)
+        self.assertEqual(sum(message.role == "assistant" for message in memory.recent_messages(8)), 1)
+        memory.close()
+
+    def test_interrupted_buffered_voice_stream_records_only_reported_delivery(self):
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        fixed = datetime(2026, 9, 28, 13, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
+        model = ScriptedModel('unexpected model response')
+        orchestrator = RequestOrchestrator(
+            Settings(),
+            model,
+            ToolRegistry([LocalTimeTool(Settings(), clock=lambda zone: fixed.astimezone(zone))]),
+            memory=memory,
+        )
+        delivered_text = []
+        cancel_event = threading.Event()
+        stream = orchestrator.stream(
+            "What time is it?",
+            cancel_event=cancel_event,
+            delivered_text=delivered_text,
+        )
+
+        self.assertEqual(next(stream).kind, "text")
+        delivered_text.append("The local time is 1:05 PM.")
+        cancel_event.set()
+        stream.close()
+        assistant = next(
+            message for message in memory.recent_messages(8)
+            if message.role == "assistant"
+        )
+
+        self.assertEqual(assistant.content, "The local time is 1:05 PM.")
+        self.assertTrue(assistant.incomplete)
+        self.assertEqual(model.calls, [])
+        memory.close()
+
     def test_planner_logs_completion_reason_without_request_text(self):
         request = "Explain Kafka briefly"
         model = ScriptedModel(
@@ -369,6 +434,89 @@ class FactualToolTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_transcript_correction_is_one_step_and_never_executes_tools_or_saves_memory(self):
+        memory = MemoryManager(SQLiteMemoryStore(":memory:"))
+        tool = FakeTool("reminder", ToolResult("must not run"))
+        model = ScriptedModel(json.dumps({
+            "type": "final",
+            "response": "CORRECTION: Remind me to call at five PM",
+            "memory_suggestions": [{
+                "kind": "fact", "content": "unconfirmed correction", "topic": ""
+            }],
+        }))
+        orchestrator = RequestOrchestrator(
+            Settings(), model, ToolRegistry([tool]), memory=memory
+        )
+
+        correction = orchestrator.suggest_transcript_correction(
+            "Remind me to call at file PM"
+        )
+
+        self.assertEqual(correction, "Remind me to call at five PM")
+        self.assertEqual(tool.calls, [])
+        self.assertEqual(memory.list_memories(), [])
+        self.assertEqual(len(model.calls), 1)
+        memory.close()
+
+    def test_transcript_correction_rejects_uncertain_or_unchanged_output(self):
+        for response in ("UNCERTAIN", "CORRECTION: file"):
+            with self.subTest(response=response):
+                model = ScriptedModel(json.dumps({
+                    "type": "final", "response": response, "memory_suggestions": []
+                }))
+                orchestrator = RequestOrchestrator(
+                    Settings(), model, ToolRegistry([])
+                )
+
+                self.assertIsNone(
+                    orchestrator.suggest_transcript_correction("file")
+                )
+
+    def test_explicit_news_route_uses_news_category_buffered_and_streamed(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                settings = replace(
+                    Settings(online_tools_enabled=True),
+                    searxng_base_url="https://search.example.test",
+                    searxng_allowed_hosts=("search.example.test",),
+                )
+                transport = FakeFactualTransport([{"results": [{
+                    "title": "Space mission launches", "content": "A reported launch.",
+                    "url": "https://publisher.test/story",
+                }]}])
+                model = ScriptedModel('{"type":"final","response":"A space mission launched."}')
+                orchestrator = RequestOrchestrator(
+                    settings, model, create_default_tools(settings, transport=transport)
+                )
+                if streamed:
+                    events = list(orchestrator.stream("Latest space news"))
+                    self.assertEqual(events[-1].kind, "completed")
+                else:
+                    result = orchestrator.handle("Latest space news")
+                    self.assertTrue(result.completed)
+                    self.assertEqual(result.route.action, "news")
+                self.assertEqual(len(transport.calls), 1)
+                self.assertEqual(transport.calls[0][1]["categories"], "news")
+                prompt = " ".join(message.content for message in model.calls[0][0])
+                self.assertIn("https://publisher.test/story", prompt)
+
+    def test_news_disabled_and_provider_failures_do_not_call_model(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                settings = replace(
+                    Settings(online_tools_enabled=enabled),
+                    searxng_base_url="https://search.example.test",
+                    searxng_allowed_hosts=("search.example.test",),
+                )
+                transport = FakeFactualTransport([TimeoutError("private details")])
+                model = ScriptedModel("must not run")
+                result = RequestOrchestrator(
+                    settings, model, create_default_tools(settings, transport=transport)
+                ).handle("Latest space news")
+                self.assertFalse(result.completed)
+                self.assertIn("timed out" if enabled else "offline", result.response)
+                self.assertEqual(model.calls, [])
+
     def test_offline_direct_routes_block_registered_fake_tools_and_model(self):
         for name, request in (
             ("weather", "What's the weather in Pune?"),

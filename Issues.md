@@ -61,7 +61,7 @@ A diagnostic direct Ollama request using the planner's task state and a 264-toke
 **Next actions:**
 
 1. Time direct typed and spoken reasoning requests with the same model and prompt; confirm normal turns finish within the configured budget.
-2. Log safe stage timings (transcription end, model start/finish, TTS start/finish) and agent completion reason. Do not log private full conversation content.
+2. Log stage timings and agent completion reason. Phase 16 now logs accepted transcripts and generated answers at normal INFO level, including in Incognito; logs omit raw audio, credentials, hidden reasoning, and planner JSON. Confirm log destination and retention before adding any separate sink or policy.
 3. Confirm the configured HTTP/model timeout bounds a live request and that a timeout does not leave an unbounded worker or stale request competing with subsequent turns.
 4. If the turn still exceeds the deadline, inspect Ollama request duration and agent retry count; tune context, output budget, or model options only from those measurements.
 
@@ -159,19 +159,11 @@ A single typed inference, an isolated TTS run, or the 12-cycle interruption stre
 
 ## P2: Phase 15 Model Depot, Piper, and Streamed Voice Acceptance
 
-**Status:** Implemented and regression-tested locally; not deployed or Pi-verified. Legacy/VOSK and KittenTTS remain the supported staging profile.
+**Status:** Completed and Pi-verified (owner-confirmed 2026-10-09). Legacy/VOSK remains the supported activation profile pending separate Phase 13 and Phase 16 gates.
 
-**Evidence:** Local coverage verifies model ID/path resolution, persistent selection, one-model LLM load/unload/switch, stable offline inventory, sequential benchmark JSON, selectable Whisper PTT, lazy Piper asset loading, metadata-rate chunk playback, streamed first-phrase delivery, GPIO16 cancellation, reminder serialization, idle eviction, and Hey Orion/Jarvis-to-VOSK startup fallback. A trained Hey Orion classifier bundle and feature graphs now exist locally; ONNX structural and zero-input CPU inference checks pass. Deployment sync now includes the Hey Orion bundle and sets `ORION_WAKEWORD_MODEL_ID=hey-orion`, while leaving capture on legacy/VOSK. The generated provenance manifest, full evaluation report, license review, and Pi acoustic acceptance remain outstanding. Piper package/voice licenses remain unreviewed. BGE inference is an optional provider boundary only; semantic retrieval remains unchanged.
+**Evidence:** Local regression coverage verifies model ID/path resolution, persistent selection, one-model LLM load/unload/switch, stable offline inventory, sequential benchmark JSON, selectable Whisper PTT, lazy Piper asset loading, metadata-rate chunk playback, streamed first-phrase delivery, GPIO16 cancellation, reminder serialization, idle eviction, and wake fallback. The owner confirms Phase 15 deployment, artifact and license checks, and Pi acceptance gates passed. BGE remains an optional provider boundary; semantic retrieval remains deferred.
 
-**Next actions:**
-
-1. Add the training-produced provenance manifest and evaluation report to the approved bundle. Record source, revision, SHA-256, and license; keep VOSK separately provisioned for rollback.
-2. Deploy and validate the Hey Orion classifier and feature assets. Preserve legacy/VOSK and verify rollback before enabling wake capture.
-3. Run `orion-model validate` for each selected model, then benchmark candidate GGUFs sequentially under identical Pi conditions.
-4. Test offline cold start, first phrase timing, GPIO16 interruption, wakeword barge-in, command capture after playback stops, speaker leakage/false wake activation, reminder serialization/retry, idle eviction, shutdown, reboot, and a 30-minute soak on the Pi.
-5. Record memory, CPU, temperature, throttling, swap, and latency. Do not promote the candidate based on local tests.
-
-**Close when:** The provisioned profile passes the documented clean-install and Pi gates, license/provenance records exist, and rollback preserves user data and the legacy profile.
+**Follow-up:** Remaining Phase 13 wake-asset gates and Phase 16 release acceptance remain tracked separately. Phase 15 completion does not promote deployment defaults.
 
 ## P3: Conservative Hybrid Routing Coverage
 

@@ -50,12 +50,16 @@ class _StatusSpeechOutput:
     def warmup(self) -> None:
         self.speech_output.warmup()
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> bool:
         with self._lock:
             outer_call = self._session_depth == 0
             self.set_status("SPEAKING")
             try:
-                self.speech_output.speak(text)
+                completed = self.speech_output.speak(text)
+                interrupt_event = self.interrupt_event
+                return completed is not False and not (
+                    interrupt_event is not None and interrupt_event.is_set()
+                )
             finally:
                 if outer_call:
                     self.set_status("IDLE")
@@ -118,6 +122,31 @@ def _confirm_spoken_action(prompt: str, audio_input, speech_output) -> bool:
     if hasattr(audio_input, "claim_utterance") and not audio_input.claim_utterance():
         return False
     return answer in {"yes", "yes confirm", "confirm", "do it"}
+
+
+def _transcription_confidence(audio_input) -> float | None:
+    confidence = getattr(audio_input, "transcription_confidence", None)
+    if confidence is None:
+        transcriber = getattr(audio_input, "transcriber", audio_input)
+        confidence = getattr(transcriber, "last_confidence", None)
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        return None
+    return float(confidence)
+
+
+def _capture_transcript_confirmation(audio_input, *, followup_active: bool) -> str:
+    next_followup = getattr(audio_input, "next_followup_utterance", None)
+    if followup_active and next_followup is not None:
+        answer = next_followup(timeout=10.0)
+    else:
+        answer = audio_input.next_utterance(timeout=15.0)
+    if hasattr(audio_input, "claim_utterance") and not audio_input.claim_utterance():
+        return ""
+    return answer.strip()
 
 
 def _set_led_status(led, status: str) -> None:
@@ -401,18 +430,26 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
         scheduler.start()
         logger.info("Voice assistant started")
         turn_number = 0
+        followup_active = False
         while not stop_event.is_set():
             turn_number += 1
             stage_name = "input"
             stage_started = time.monotonic()
             spoken = False
+            generated_text: list[str] = []
+            delivered_text: list[str] = []
             try:
                 set_status(
                     "IDLE"
                     if isinstance(audio_input, (WakeListenerInput, WakeWordInput))
                     else "LISTENING"
                 )
-                transcript = audio_input.next_utterance()
+                logger.info("Voice stage=capture turn=%d outcome=started", turn_number)
+                next_followup = getattr(audio_input, "next_followup_utterance", None)
+                if followup_active and next_followup is not None:
+                    transcript = next_followup(timeout=10.0)
+                else:
+                    transcript = audio_input.next_utterance()
                 logger.info(
                     "Voice stage=input_total turn=%d elapsed_ms=%.1f outcome=%s",
                     turn_number,
@@ -423,18 +460,155 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     break
                 if not transcript.strip():
                     if isinstance(audio_input, WakeListenerInput):
+                        followup_active = False
                         continue
                     speech_output.speak("I didn't catch that. Please try again.")
                     continue
                 if hasattr(audio_input, "claim_utterance") and not audio_input.claim_utterance():
                     continue
-                logger.info("Transcript received (%d characters)", len(transcript))
+                logger.info("Voice transcript turn=%d text=%r", turn_number, transcript)
+                confidence = _transcription_confidence(audio_input)
+                threshold = getattr(
+                    getattr(orchestrator, "settings", None),
+                    "stt_confidence_threshold",
+                    0.55,
+                )
+                if confidence is not None:
+                    logger.info(
+                        "Voice stage=transcript_quality turn=%d min_word_confidence=%.3f outcome=%s",
+                        turn_number,
+                        confidence,
+                        "uncertain" if confidence < threshold else "accepted",
+                    )
+                if confidence is not None and confidence < threshold:
+                    set_status("PROCESSING")
+                    stage_name = "transcript_recovery"
+                    recovery_started = time.monotonic()
+                    suggest_correction = getattr(
+                        orchestrator, "suggest_transcript_correction", None
+                    )
+                    suggestion = None
+                    if suggest_correction is not None:
+                        try:
+                            suggestion = suggest_correction(transcript)
+                        except Exception as error:
+                            logger.warning(
+                                "Transcript correction suggestion failed (%s)",
+                                type(error).__name__,
+                            )
+                    logger.info(
+                        "Voice stage=llm_generation turn=%d purpose=transcript_recovery elapsed_ms=%.1f outcome=%s",
+                        turn_number,
+                        (time.monotonic() - recovery_started) * 1000,
+                        "suggested" if suggestion else "uncertain",
+                    )
+                    original_transcript = transcript
+                    accepted_correction = False
+                    if suggestion:
+                        logger.info(
+                            "Voice transcript suggestion turn=%d original=%r suggested=%r",
+                            turn_number,
+                            original_transcript,
+                            suggestion,
+                        )
+                        speech_output.speak(
+                            f"I may have misheard you. Did you mean: {suggestion}? Say yes to use it, or no to repeat."
+                        )
+                        confirmation = _capture_transcript_confirmation(
+                            audio_input, followup_active=followup_active
+                        )
+                        logger.info(
+                            "Voice transcript confirmation turn=%d text=%r",
+                            turn_number,
+                            confirmation,
+                        )
+                        affirmative = confirmation.casefold().strip(" .!?\t") in {
+                            "yes", "yes confirm", "confirm", "correct", "do it",
+                        }
+                        if affirmative:
+                            transcript = suggestion
+                            accepted_correction = True
+                            logger.info(
+                                "Voice transcript interpretation turn=%d original=%r corrected=%r confirmed=true",
+                                turn_number,
+                                original_transcript,
+                                transcript,
+                            )
+
+                    if not accepted_correction:
+                        speech_output.speak(
+                            "Please repeat the full request."
+                            if suggestion
+                            else "I couldn't understand that. Please repeat your request."
+                        )
+                        retry_started = time.monotonic()
+                        repeated_transcript = _capture_transcript_confirmation(
+                            audio_input, followup_active=followup_active
+                        )
+                        retry_confidence = _transcription_confidence(audio_input)
+                        logger.info(
+                            "Voice transcript retry turn=%d elapsed_ms=%.1f text=%r min_word_confidence=%s",
+                            turn_number,
+                            (time.monotonic() - retry_started) * 1000,
+                            repeated_transcript,
+                            f"{retry_confidence:.3f}" if retry_confidence is not None else "unavailable",
+                        )
+                        if repeated_transcript and (
+                            retry_confidence is None or retry_confidence >= threshold
+                        ):
+                            transcript = repeated_transcript
+                        else:
+                            logger.warning(
+                                "Voice transcript rejected turn=%d reason=unclear_after_retry",
+                                turn_number,
+                            )
+                            speech_output.speak(
+                                "I still couldn't understand. Please say the wake phrase to try again."
+                            )
+                            followup_active = False
+                            continue
+
+                router = getattr(orchestrator, "router", None)
+                decision = router.route(transcript) if router is not None else None
+                if decision is not None:
+                    logger.info(
+                        "Voice stage=routing turn=%d outcome=completed route=%s action=%s",
+                        turn_number,
+                        decision.kind.value,
+                        decision.action or "none",
+                    )
+                model_route = decision is None or decision.kind.value in {
+                    "LLM_REASONING", "ONLINE_FACTUAL_LOOKUP"
+                } or (
+                    decision.kind.value == "REMINDER"
+                    and decision.action in {"create", "update"}
+                )
                 set_status("PROCESSING")
                 stage_name = "orchestration"
                 stage_started = time.monotonic()
                 stream_response = getattr(orchestrator, "stream", None)
                 if stream_response is None:
+                    generation_started = time.monotonic()
+                    if model_route:
+                        logger.info(
+                            "Voice stage=llm_generation turn=%d outcome=started",
+                            turn_number,
+                        )
                     result = orchestrator.handle(transcript)
+                    generated_text.append(result.response)
+                    logger.info(
+                        "Voice response turn=%d generated_text=%r outcome=%s",
+                        turn_number,
+                        result.response,
+                        "completed" if result.completed else "failed",
+                    )
+                    if model_route:
+                        logger.info(
+                            "Voice stage=llm_generation turn=%d elapsed_ms=%.1f outcome=%s",
+                            turn_number,
+                            (time.monotonic() - generation_started) * 1000,
+                            "completed" if result.completed else "failed",
+                        )
                     if stop_event.is_set():
                         break
                     logger.info(
@@ -447,11 +621,23 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     set_status("SPEAKING")
                     stage_name = "tts"
                     stage_started = time.monotonic()
-                    speech_output.speak(result.response)
+                    speech_completed = speech_output.speak(result.response)
+                    if speech_completed is not False and not stop_event.is_set():
+                        delivered_text.append(result.response)
                     logger.info(
-                        "Voice stage=tts turn=%d elapsed_ms=%.1f outcome=returned",
+                        "Voice stage=speech_delivery turn=%d elapsed_ms=%.1f outcome=%s",
                         turn_number,
                         (time.monotonic() - stage_started) * 1000,
+                        "completed" if speech_completed is not False else "interrupted",
+                    )
+                    logger.info(
+                        "Voice response delivery turn=%d delivered_text=%r",
+                        turn_number,
+                        " ".join(delivered_text),
+                    )
+                    followup_active = (
+                        next_followup is not None
+                        and (speech_completed is False or result.completed)
                     )
                 else:
                     phrase_buffer = SpeechPhraseBuffer()
@@ -459,6 +645,13 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                     completed = False
                     failed = False
                     interrupted = False
+                    speech_delivery_started = None
+                    generation_started = time.monotonic()
+                    if model_route:
+                        logger.info(
+                            "Voice stage=llm_generation turn=%d outcome=started",
+                            turn_number,
+                        )
                     session = getattr(speech_output, "session", None)
                     turn = getattr(speech_output, "turn", None)
                     with ExitStack() as active_turn:
@@ -467,50 +660,99 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                             if turn is not None else Event()
                         )
                         session_started = False
-                        stream = iter(stream_response(transcript, cancel_event=cancellation))
+                        if isinstance(orchestrator, RequestOrchestrator):
+                            stream = iter(
+                                stream_response(
+                                    transcript,
+                                    cancel_event=cancellation,
+                                    delivered_text=delivered_text,
+                                )
+                            )
+                        else:
+                            stream = iter(
+                                stream_response(transcript, cancel_event=cancellation)
+                            )
+
+                        def speak_phrases(phrases):
+                            nonlocal session_started, spoken, speech_delivery_started, stage_name
+                            if phrases and speech_delivery_started is None:
+                                speech_delivery_started = time.monotonic()
+                            for phrase in phrases:
+                                if stop_event.is_set() or cancellation.is_set():
+                                    break
+                                stage_name = "tts"
+                                if session is not None and not session_started:
+                                    active_turn.enter_context(session())
+                                    session_started = True
+                                spoken = True
+                                speech_completed = speech_output.speak(phrase)
+                                if (
+                                    speech_completed is not False
+                                    and not cancellation.is_set()
+                                    and not stop_event.is_set()
+                                ):
+                                    delivered_text.append(phrase)
+
                         try:
                             for event in stream:
                                 if stop_event.is_set() or cancellation.is_set():
                                     break
                                 if event.kind == "text":
-                                    phrases = phrase_buffer.feed(event.text)
-                                    if phrases:
-                                        stage_name = "tts"
-                                        if session is not None and not session_started:
-                                            active_turn.enter_context(session())
-                                            session_started = True
-                                        for phrase in phrases:
-                                            if stop_event.is_set() or cancellation.is_set():
-                                                break
-                                            spoken = True
-                                            speech_output.speak(phrase)
+                                    generated_text.append(event.text)
+                                    speak_phrases(phrase_buffer.feed(event.text))
                                 elif event.kind == "completed":
                                     completed = True
+                                    speak_phrases(phrase_buffer.feed("", final=True))
                                 elif event.kind == "failed":
                                     failed = True
+                                    speak_phrases(phrase_buffer.feed("", final=True))
                                     break
                         finally:
                             close_stream = getattr(stream, "close", None)
                             if close_stream is not None:
                                 close_stream()
-                        if not stop_event.is_set() and not cancellation.is_set():
-                            tail_phrases = phrase_buffer.feed("", final=True)
-                            if tail_phrases and session is not None and not session_started:
-                                active_turn.enter_context(session())
-                                session_started = True
-                            for phrase in tail_phrases:
-                                spoken = True
-                                speech_output.speak(phrase)
                         interrupted = cancellation.is_set()
                     if stop_event.is_set():
                         break
                     if failed:
                         logger.warning("Voice stream failed completed=%s", completed)
                     if failed and not spoken and not interrupted:
-                        speech_output.speak(
-                            "I couldn't process that turn. Please try again."
-                        )
+                        error_response = "I couldn't process that turn. Please try again."
+                        if speech_delivery_started is None:
+                            speech_delivery_started = time.monotonic()
+                        speech_completed = speech_output.speak(error_response)
+                        if speech_completed is not False and not stop_event.is_set():
+                            delivered_text.append(error_response)
                         spoken = True
+                    generation_outcome = (
+                        "interrupted" if interrupted else
+                        "failed" if failed else
+                        "completed" if completed else "incomplete"
+                    )
+                    if model_route:
+                        logger.info(
+                            "Voice stage=llm_generation turn=%d elapsed_ms=%.1f outcome=%s",
+                            turn_number,
+                            (time.monotonic() - generation_started) * 1000,
+                            generation_outcome,
+                        )
+                    logger.info(
+                        "Voice response turn=%d generated_text=%r delivered_text=%r outcome=%s",
+                        turn_number,
+                        "".join(generated_text),
+                        " ".join(delivered_text),
+                        generation_outcome,
+                    )
+                    logger.info(
+                        "Voice stage=speech_delivery turn=%d elapsed_ms=%.1f outcome=%s",
+                        turn_number,
+                        (time.monotonic() - speech_delivery_started) * 1000
+                        if speech_delivery_started is not None else 0.0,
+                        "interrupted" if interrupted else "completed" if delivered_text else "no_output",
+                    )
+                    followup_active = next_followup is not None and (
+                        completed or interrupted
+                    )
                     logger.info(
                         "Voice stage=orchestration turn=%d elapsed_ms=%.1f route=stream completed=%s failed=%s",
                         turn_number,
@@ -524,6 +766,15 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                         "streamed" if spoken else "no_output",
                     )
             except Exception as error:
+                if isinstance(audio_input, WakeListenerInput):
+                    followup_active = False
+                if generated_text:
+                    logger.info(
+                        "Voice response turn=%d generated_text=%r delivered_text=%r outcome=failed",
+                        turn_number,
+                        "".join(generated_text),
+                        " ".join(delivered_text),
+                    )
                 logger.warning(
                     "Voice turn failed turn=%d stage=%s elapsed_ms=%.1f (%s)",
                     turn_number,
@@ -581,7 +832,7 @@ def _run_voice_service(settings: Settings) -> None:
     led = None
     voice_status = _VoiceStatusLED()
     audio_input = button = interrupt_button = None
-    model = memory = reminders = scheduler = speech_output = idle_thread = None
+    model = memory = reminders = scheduler = speech_output = idle_thread = notifier = None
 
     def set_status(status: str) -> None:
         voice_status.set_status(status)
@@ -609,10 +860,9 @@ def _run_voice_service(settings: Settings) -> None:
             daemon=True,
         )
         idle_thread.start()
+        notifier = ReminderNotifier(speak, set_status)
         scheduler = ReminderScheduler(
-            reminders.store,
-            ReminderNotifier(speak, set_status),
-            poll_interval=settings.reminder_poll_interval,
+            reminders.store, notifier, poll_interval=settings.reminder_poll_interval
         )
 
         def stop_service(_signum, _frame) -> None:
@@ -627,6 +877,8 @@ def _run_voice_service(settings: Settings) -> None:
             )
         else:
             audio_input, button = _create_audio_input(settings, gate, stop_event)
+        if isinstance(audio_input, WakeListenerInput):
+            notifier.on_speech_complete = audio_input.open_followup_window
 
         interrupt_button = _create_interrupt_button(settings, gate, button)
 

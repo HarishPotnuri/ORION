@@ -57,7 +57,7 @@ Registry inventory:
 - `bge-small-en-v1.5`: `EMBEDDING/BGE-small-en-v1.5-model.onnx`.
 - `hey-orion`: trained local `WAKEWORD/hey_orion.onnx` candidate, external weights, and shared feature ONNX files. `phase13-artifacts.json` remains required before activation; Hey Jarvis remains a staging fallback. `vosk-en-small` uses a separately provisioned directory, not this depot.
 
-Piper package and voice licenses still need review. Quantized Q8 models use more storage and may need more RAM than corresponding smaller quantizations; collect target measurements instead of relying on estimates. No candidate's Pi performance is implied by registry presence.
+The selected Piper package and voice passed license review for the verified Phase 15 profile. Quantized Q8 models use more storage and may need more RAM than corresponding smaller quantizations; collect target measurements instead of relying on estimates. Other candidates' Pi performance is not implied by registry presence.
 
 During provisioning, the depot can be copied to the Pi with the commands below. Normal `deploy-pi.ps1` runs compare each local asset's relative path and byte size with the Pi, transferring missing or size-mismatched files while leaving matching assets untouched. This synchronization runs during deployment, not application startup:
 
@@ -189,7 +189,7 @@ In the candidate profile GPIO23 toggles persistent microphone mute/unmute; GPIO1
 
 With `ORION_TTS_BACKEND=kittentts`, `ORION_TTS_MODEL_PATH` is optional and points to a local KittenTTS ONNX model directory. If unset, the existing KittenTTS model identifier uses the pre-provisioned Hugging Face cache while runtime offline mode is enforced. A configured local directory never falls back to Hub access when its config or model files are missing.
 
-Phase 15 adds an opt-in Piper path. Set `ORION_TTS_BACKEND=piper` and point `ORION_TTS_MODEL_PATH` to a provisioned voice `.onnx` file with its adjacent `.onnx.json` config. `en_US-lessac-medium` is the initial candidate, not a verified or bundled artifact; verify package and voice licenses before distribution. `ORION_TTS_THREADS` sets CPU inference threads, `ORION_TTS_SAMPLE_RATE` sets playback rate, and `ORION_RUNTIME_IDLE_TIMEOUT` sets lazy LLM/Piper eviction in seconds. Missing assets fail locally; ORION does not download or substitute voices.
+Phase 15 adds an opt-in Piper path. Set `ORION_TTS_BACKEND=piper` and point `ORION_TTS_MODEL_PATH` to a provisioned voice `.onnx` file with its adjacent `.onnx.json` config. `en_US-lessac-medium` is the verified profile's initial candidate. `ORION_TTS_THREADS` sets CPU inference threads, `ORION_TTS_SAMPLE_RATE` sets playback rate, and `ORION_RUNTIME_IDLE_TIMEOUT` sets lazy LLM/Piper eviction in seconds. Missing assets fail locally; ORION does not download or substitute voices.
 
 ### Download models and configure runtime
 
@@ -204,7 +204,7 @@ rm /tmp/vosk-model.zip
 
 The Phase 14 source selects `llama.cpp`; Ollama is not a supported backend. Provision the pinned Qwen GGUF and build `llama-server` from the exact commit in [Phase 14 model and runtime pins](docs/phase14-artifacts.md). Do not deploy this source to the Pi until Phase 16 promotion and acceptance. The Pi's deployed revision remains on its previous runtime until then. ORION never downloads a model at startup.
 
-KittenTTS setup remains separate. Its first initialization uses pre-provisioned local assets or a Hub cache. Set `HF_HUB_OFFLINE=1` after provisioning to block runtime downloads. Voice startup no longer warms STT or TTS. The first utterance pays model initialization cost; the configurable idle monitor releases an inactive owned LLM or Piper model after 60 seconds by default. Phase 15 remains locally tested only; provision and license-check Piper assets before use, then complete Pi audio, interruption, reboot, and soak checks.
+KittenTTS setup remains separate. Its first initialization uses pre-provisioned local assets or a Hub cache. Set `HF_HUB_OFFLINE=1` after provisioning to block runtime downloads. Voice startup no longer warms STT or TTS. The first utterance pays model initialization cost; the configurable idle monitor releases an inactive owned LLM or Piper model after 60 seconds by default. The owner confirms Phase 15 completed and Pi-verified on 2026-10-09. Keep deployment defaults pending Phase 16 acceptance and promotion.
 
 For each interactive shell, activate `.venv-voice` and configure ORION. These environment variables are required because settings revert to defaults in a new shell. Add the exports to the user's `~/.bashrc` after validating the setup if they should persist for interactive logins.
 

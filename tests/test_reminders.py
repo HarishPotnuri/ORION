@@ -85,6 +85,35 @@ class ReminderParserTests(unittest.TestCase):
         self.assertEqual(weekly.recurrence_weekday, 0)
         self.assertEqual(weekly.due_at, datetime(2026, 10, 5, 9, 0, tzinfo=self.zone))
 
+    def test_recurring_schedule_is_not_part_of_title_or_notes(self):
+        for schedule in ("every day", "every Monday"):
+            with self.subTest(schedule=schedule):
+                parsed = self.parser.parse(
+                    f"Remind me to review tasks {schedule} at 8 PM", now=self.now
+                )
+                self.assertEqual(parsed.title, "review tasks")
+                self.assertEqual(parsed.notes, "")
+
+    def test_zero_and_conflicting_schedules_require_clarification(self):
+        for request in (
+            "Remind me in 0 minutes to check deployment",
+            "Remind me tomorrow at 1 PM or 2 PM to check deployment",
+            "Remind me in 5 minutes or in 10 minutes to check deployment",
+            "Remind me today or tomorrow at 1 PM to check deployment",
+        ):
+            with self.subTest(request=request), self.assertRaises(ReminderParseError):
+                self.parser.parse(request, now=self.now)
+
+    def test_explicit_utc_is_not_silently_interpreted_as_ist(self):
+        with self.assertRaisesRegex(ReminderParseError, "timezone"):
+            self.parser.parse("Remind me tomorrow at 1 PM UTC to review tasks", now=self.now)
+
+    def test_relative_hours_are_elapsed_time_across_dst(self):
+        parser = ReminderParser("America/New_York")
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+        due, _, _ = parser.parse_schedule("in 2 hours", now=now)
+        self.assertEqual((due.astimezone(UTC) - now.astimezone(UTC)).total_seconds(), 7200)
+
     def test_parses_schedule_without_requiring_a_new_title(self):
         due_at, recurrence, weekday = self.parser.parse_schedule(
             "Reschedule project meeting to tomorrow at 3 PM",
@@ -156,6 +185,21 @@ class ReminderStoreTests(unittest.TestCase):
     def test_due_query_requires_aware_clock(self):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
             self.store.due(datetime(2026, 9, 29, 13, 0))
+
+    def test_update_lost_race_to_cancellation_does_not_report_success(self):
+        reminder = self.create()
+        original_get = self.store.get
+
+        def get_then_cancel(identifier):
+            existing = original_get(identifier)
+            self.store.cancel(identifier)
+            return existing
+
+        with patch.object(self.store, "get", side_effect=get_then_cancel):
+            updated = self.store.update(reminder.id, notes="New notes")
+
+        self.assertIsNone(updated)
+        self.assertEqual(original_get(reminder.id).status, ReminderStatus.CANCELLED)
 
     def test_reminders_coexist_with_memory_schema_in_same_database(self):
         from orion.memory.manager import MemoryManager
@@ -332,11 +376,16 @@ class ReminderSchedulerTests(unittest.TestCase):
         )
         statuses = []
         speech = []
-        notifier = ReminderNotifier(speech.append, statuses.append)
+        followup_windows = []
+        notifier = ReminderNotifier(
+            speech.append, statuses.append,
+            on_speech_complete=lambda: followup_windows.append(True),
+        )
 
         notifier(reminder)
 
         self.assertEqual(statuses, ["SPEAKING", "IDLE"])
+        self.assertEqual(followup_windows, [True])
         self.assertEqual(
             speech,
             ["Reminder: project meeting. Discuss API migration"],
@@ -352,10 +401,35 @@ class ReminderSchedulerTests(unittest.TestCase):
         def fail_speech(_text):
             raise RuntimeError("speaker unavailable")
 
-        notifier = ReminderNotifier(fail_speech, statuses.append)
+        followup_windows = []
+        notifier = ReminderNotifier(
+            fail_speech, statuses.append,
+            on_speech_complete=lambda: followup_windows.append(True),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "speaker unavailable"):
             notifier(reminder)
+        self.assertEqual(statuses, ["SPEAKING", "IDLE"])
+        self.assertEqual(followup_windows, [])
+
+    def test_notifier_followup_failure_does_not_fail_delivered_reminder(self):
+        reminder = ReminderManager(self.store).create_from_request(
+            "Remind me tomorrow at 1 PM to test follow-up",
+            now=datetime(2026, 9, 28, 10, 0, tzinfo=self.zone),
+        )
+        statuses = []
+
+        def fail_followup():
+            raise RuntimeError("listener unavailable")
+
+        notifier = ReminderNotifier(
+            lambda _text: None,
+            statuses.append,
+            on_speech_complete=fail_followup,
+        )
+
+        notifier(reminder)
+
         self.assertEqual(statuses, ["SPEAKING", "IDLE"])
 
     def test_cli_starts_reminder_service_mode(self):
