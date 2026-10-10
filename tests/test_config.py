@@ -259,6 +259,13 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.searxng_allowed_hosts, ("search.example.test",))
 
+    def test_online_tools_default_on_with_explicit_offline_override(self) -> None:
+        self.assertTrue(Settings().online_tools_enabled)
+        with self.clean_environment({}):
+            self.assertTrue(Settings.from_environment().online_tools_enabled)
+        with self.clean_environment({"ORION_ONLINE_TOOLS_ENABLED": "false"}):
+            self.assertFalse(Settings.from_environment().online_tools_enabled)
+
     def test_rejects_searxng_host_missing_from_allowlist(self) -> None:
         values = {
             "ORION_SEARXNG_BASE_URL": "https://search.example.test",

@@ -18,6 +18,7 @@ from orion.app import (
     main,
 )
 from orion.audio.capture import AudioGate
+from orion.audio.listener import WakeListenerInput
 from orion.audio.stt import PushToTalkInput, WakeWordInput
 from orion.config import Settings
 from orion.core.orchestrator import RequestOrchestrator
@@ -634,6 +635,56 @@ class VoiceServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(handled, [])
+
+    def test_muted_empty_capture_waits_for_unmute_instead_of_retrying(self):
+        stop_event = threading.Event()
+        wait_calls = []
+        scheduler = FakeScheduler()
+
+        class Control:
+            muted = True
+
+        class AudioInput(WakeListenerInput):
+            def __init__(self):
+                self.control = Control()
+                self.calls = 0
+
+            def next_utterance(self):
+                self.calls += 1
+                return ""
+
+            def wait_until_unmuted(self):
+                wait_calls.append(True)
+                self.control.muted = False
+                return True
+
+        class Orchestrator:
+            def handle(self, _request):
+                raise AssertionError("Muted input must not reach orchestration")
+
+        class SpeechOutput:
+            def speak(self, _text):
+                raise AssertionError("Muted empty input must not trigger speech")
+
+        class OneIterationStopEvent:
+            calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                return self.calls > 2
+
+            def set(self):
+                stop_event.set()
+
+            def wait(self, _timeout):
+                return stop_event.wait(0)
+
+        _run_voice_loop(
+            AudioInput(), Orchestrator(), SpeechOutput(), scheduler,
+            OneIterationStopEvent(), lambda _status: None,
+        )
+
+        self.assertEqual(wait_calls, [True])
 
     def test_incognito_voice_turn_still_logs_full_transcript_and_answer(self):
         stop_event = threading.Event()

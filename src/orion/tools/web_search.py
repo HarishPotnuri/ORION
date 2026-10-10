@@ -1,4 +1,4 @@
-"""Allowlisted SearXNG factual search adapter."""
+"""Public RSS search and news with an optional allowlisted SearXNG adapter."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +15,15 @@ from ..core.contracts import ToolResult
 from ..core.policy import NetworkPolicy
 from ..llm.runtime import LocalJsonTransport
 from ._factual import factual_failure
+
+
+class _FeedText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
 
 
 class SearxngSearchTool:
@@ -40,11 +50,6 @@ class SearxngSearchTool:
                 "Web search is disabled in offline mode. Enable online tools to use it.",
                 success=False,
             )
-        if not self.settings.searxng_base_url:
-            return ToolResult(
-                "Web search is not configured. Configure an HTTPS SearXNG instance and exact allowed host.",
-                success=False,
-            )
         query = self._query(str(arguments.get("query", "")))
         if not query:
             return ToolResult("Please specify what to search for.", success=False)
@@ -57,19 +62,26 @@ class SearxngSearchTool:
             return ToolResult("Search category must be general or news.", success=False)
         deadline = time.monotonic() + timeout
 
-        parsed = urlparse(self.settings.searxng_base_url)
+        provider = "SearXNG" if self.settings.searxng_base_url else "Public RSS"
+        endpoint = self.settings.searxng_base_url
         allowed_hosts = set(self.settings.searxng_allowed_hosts)
-        if parsed.hostname is None or parsed.hostname.lower() not in allowed_hosts:
-            return ToolResult("Web search is blocked by the configured host policy.", success=False)
+        if endpoint:
+            endpoint = f"{endpoint.rstrip('/')}/search"
+            params = {"q": query, "format": "json", "categories": category}
+            fetch = self.transport.get_factual_json
+        else:
+            allowed_hosts = {"www.bing.com", "news.google.com"}
+            endpoint = "https://www.bing.com/search"
+            params = {"q": query, "format": "rss"}
+            if category == "news":
+                endpoint = "https://news.google.com/rss/search"
+                params = {"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
+            fetch = self.transport.get_factual_rss
         try:
-            self.policy.validate_factual_url(self.settings.searxng_base_url, allowed_hosts)
-            response = self.transport.get_factual_json(
-                f"{self.settings.searxng_base_url.rstrip('/')}/search",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "categories": category,
-                },
+            self.policy.validate_factual_url(endpoint, allowed_hosts)
+            response = fetch(
+                endpoint,
+                params=params,
                 allowed_hosts=allowed_hosts,
                 timeout=timeout,
                 policy=self.policy,
@@ -96,17 +108,22 @@ class SearxngSearchTool:
                 if source.scheme not in {"http", "https"} or not source.hostname or source.username or source.password:
                     continue
                 if title or snippet:
-                    results.append({"title": title, "snippet": snippet, "source": url})
+                    result = {"title": title, "snippet": snippet, "source": url}
+                    if item.get("published"):
+                        result["published"] = self._compact(item["published"])
+                    results.append(result)
             if not results:
                 return ToolResult("Search returned no results.", success=False)
             return ToolResult(
                 json.dumps({"query": query, "results": results}, ensure_ascii=False, separators=(",", ":"))
             )
         except Exception as error:
-            return factual_failure("Web search", "SearXNG", error)
+            return factual_failure("Web search", provider, error)
 
     def _compact(self, value: object) -> str:
-        text = " ".join(value.split()) if isinstance(value, str) else ""
+        parser = _FeedText()
+        parser.feed(value if isinstance(value, str) else "")
+        text = " ".join(" ".join(parser.parts).split())
         if len(text) <= self.max_field_chars:
             return text
         return text[: self.max_field_chars - 3].rsplit(" ", 1)[0] + "..."

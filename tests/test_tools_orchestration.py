@@ -291,6 +291,7 @@ class LocalToolTests(unittest.TestCase):
 class FactualToolTests(unittest.TestCase):
     def test_offline_tools_block_transport_even_when_search_is_configured(self):
         settings = Settings(
+            online_tools_enabled=False,
             searxng_base_url="https://search.example.test",
             searxng_allowed_hosts=("search.example.test",),
         )
@@ -366,8 +367,11 @@ class FactualToolTests(unittest.TestCase):
         self.assertIn("specify a city", result.content)
         self.assertEqual(transport.calls, [])
 
-    def test_search_fails_closed_when_not_configured(self):
-        transport = FakeFactualTransport([])
+    def test_search_defaults_to_public_rss_when_not_configured(self):
+        transport = unittest.mock.Mock()
+        transport.get_factual_rss.return_value = {
+            "results": [{"title": "Weather", "url": "https://source.test/weather"}]
+        }
         tool = SearxngSearchTool(Settings(online_tools_enabled=True), transport=transport)
 
         result = tool.execute(
@@ -376,9 +380,8 @@ class FactualToolTests(unittest.TestCase):
             cancel_event=threading.Event(),
         )
 
-        self.assertFalse(result.success)
-        self.assertIn("not configured", result.content)
-        self.assertEqual(transport.calls, [])
+        self.assertTrue(result.success)
+        self.assertEqual(transport.get_factual_rss.call_args.args[0], "https://www.bing.com/search")
 
     def test_search_compacts_results_and_limits_fields(self):
         settings = replace(
@@ -525,7 +528,7 @@ class OrchestrationTests(unittest.TestCase):
             with self.subTest(tool=name):
                 tool = FakeTool(name, ToolResult("must not run"))
                 model = ScriptedModel('{"type":"final","response":"must not run"}')
-                orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([tool]))
+                orchestrator = RequestOrchestrator(Settings(online_tools_enabled=False), model, ToolRegistry([tool]))
 
                 result = orchestrator.handle(request)
 
@@ -546,7 +549,7 @@ class OrchestrationTests(unittest.TestCase):
                     json.dumps({"type": "final", "response": "Lookup is disabled in offline mode. It is 1 PM."}),
                 )
                 orchestrator = RequestOrchestrator(
-                    Settings(), model, ToolRegistry([factual, time_tool])
+                    Settings(online_tools_enabled=False), model, ToolRegistry([factual, time_tool])
                 )
 
                 result = orchestrator.handle(f"Check {phrase} and tell me the time")
@@ -818,20 +821,29 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_online_result_is_passed_to_local_model_not_cloud(self):
         model = ScriptedModel(
-            json.dumps({"type": "final", "response": "Pune is 28 degrees."})
+            json.dumps({"type": "final", "response": "Verified search result."})
         )
-        weather = FakeTool("weather", ToolResult('{"location":"Pune","temperature":28}'))
+        search = FakeTool("web_search", ToolResult('{"results":[{"title":"Verified result"}]}'))
         orchestrator = RequestOrchestrator(
-            Settings(online_tools_enabled=True), model, ToolRegistry([weather])
+            Settings(online_tools_enabled=True), model, ToolRegistry([search])
         )
 
-        result = orchestrator.handle("What's the weather tomorrow in Pune?")
+        result = orchestrator.handle("Search for Python documentation")
 
-        self.assertEqual(result.response, "Pune is 28 degrees.")
-        self.assertEqual(len(weather.calls), 1)
+        self.assertEqual(result.response, "Verified search result.")
+        self.assertEqual(len(search.calls), 1)
         model_prompt = " ".join(m.content for m in model.calls[0][0])
-        self.assertIn('"temperature":28', model_prompt)
+        self.assertIn("Verified result", model_prompt)
         self.assertIn("Interpret only the supplied factual result", model_prompt)
+
+    def test_incomplete_weather_data_does_not_invoke_model(self):
+        model = ScriptedModel(' {"type":"final","response":"guess"}')
+        weather = FakeTool("weather", ToolResult('{"location":"Pune"}'))
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([weather]))
+        result = orchestrator.handle("What's the weather in Pune?")
+        self.assertFalse(result.completed)
+        self.assertIn("incomplete forecast", result.response)
+        self.assertEqual(model.calls, [])
 
     def test_failed_online_lookup_does_not_invoke_model(self):
         model = ScriptedModel('{"type":"final","response":"guess"}')
@@ -846,6 +858,29 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(result.response, "Weather lookup failed.")
         self.assertEqual(len(weather.calls), 1)
         self.assertEqual(model.calls, [])
+
+    def test_weather_response_does_not_depend_on_planner(self):
+        model = ScriptedModel("invalid planner decision")
+        weather = FakeTool("weather", ToolResult(json.dumps({
+            "location": "Hyderabad, Telangana, India",
+            "timezone": "Asia/Kolkata",
+            "current": {"temperature_2m": 29, "apparent_temperature": 31, "time": "2026-10-10T09:00"},
+            "daily_units": {"temperature_2m_max": "\u00b0C"},
+            "daily": [
+                {"temperature_2m_min": 23, "temperature_2m_max": 32, "precipitation_probability_max": 20},
+                {"temperature_2m_min": 24, "temperature_2m_max": 33},
+            ],
+        })))
+        orchestrator = RequestOrchestrator(Settings(), model, ToolRegistry([weather]))
+        result = orchestrator.handle("what's the weather in hyderabad")
+        self.assertTrue(result.completed)
+        self.assertIn("29 degrees Celsius", result.response)
+        self.assertIn("Hyderabad", result.response)
+        self.assertIn("20 percent", result.response)
+        events = list(orchestrator.stream("what's the weather tomorrow in hyderabad"))
+        self.assertIn("high is 33 degrees Celsius", events[0].text)
+        self.assertEqual(model.calls, [])
+        self.assertEqual(len(weather.calls), 2)
 
     def test_capability_fallback_skips_factual_and_model_calls(self):
         model = ScriptedModel('{"type":"final","response":"guess"}')

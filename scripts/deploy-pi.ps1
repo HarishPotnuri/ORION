@@ -7,6 +7,8 @@ param(
     [string]$RemoteLlamaServer = "/usr/local/bin/llama-server",
     [string]$SshIdentityFile,
     [string]$DatabasePath = "/var/lib/orion/orion.sqlite3",
+    [switch]$EnableOnlineTools,
+    [switch]$DisableOnlineTools,
     [switch]$EnableJarvisWakeWord,
     [switch]$DisableJarvisWakeWord,
     [ValidateRange(0.0, 1.0)]
@@ -16,6 +18,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($EnableOnlineTools -and $DisableOnlineTools) {
+    throw "EnableOnlineTools and DisableOnlineTools cannot be combined."
+}
 $UseJarvisWakeWord = $EnableJarvisWakeWord -or -not $DisableJarvisWakeWord
 
 function Assert-ExitCode([string]$Step) {
@@ -31,6 +36,13 @@ function Quote-Remote([string]$Value) {
 function Invoke-Pi([string]$Command, [string]$Step, [switch]$NoSudo) {
     if ($NoSudo) {
         & ssh.exe @script:SshOptions $Target $Command
+        Assert-ExitCode $Step
+        return
+    }
+
+    if ($script:PiPasswordlessSudo) {
+        $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Command))
+        & ssh.exe @script:SshOptions -T $Target "printf %s $encodedCommand | base64 -d | bash"
         Assert-ExitCode $Step
         return
     }
@@ -197,6 +209,7 @@ $remoteConnectionVerified = $false
 $llamaCommitShort = $llamaCommit.Substring(0, 7)
 $modelEnvironmentPython = @'
 import os, pathlib, re, sys, tempfile
+from urllib.parse import urlparse
 path = pathlib.Path(sys.argv[1])
 values = {
     "ORION_MODEL_BACKEND": "llama.cpp",
@@ -217,6 +230,7 @@ values = {
     "ORION_WAKEWORD_MODEL_ID": "hey-jarvis",
     "ORION_WAKE_WORD_ENABLED": "false",
 }
+values["ORION_ONLINE_TOOLS_ENABLED"] = sys.argv[6]
 if values["ORION_MODEL_PATH"] is None:
     raise SystemExit("Q4 GGUF is missing from canonical and legacy model paths")
 original = path.stat()
@@ -243,7 +257,16 @@ try:
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
+effective = {}
+for line in updated:
+    match = re.match(r"\s*([A-Z0-9_]+)\s*=\s*(.*)$", line)
+    if match:
+        effective[match.group(1)] = match.group(2).strip().strip("\"'")
+print("online_tools_enabled=" + effective.get("ORION_ONLINE_TOOLS_ENABLED", "false").lower())
+searxng_host = urlparse(effective.get("ORION_SEARXNG_BASE_URL", "")).hostname
+print("searxng_host=" + (searxng_host or "not-configured"))
 '@
+$onlineToolsValue = if ($DisableOnlineTools) { "false" } else { "true" }
 $modelEnvironmentBase64 = [Convert]::ToBase64String(
     [System.Text.Encoding]::UTF8.GetBytes($modelEnvironmentPython)
 )
@@ -252,6 +275,9 @@ try {
     & ssh.exe @script:SshOptions $Target "true"
     Assert-ExitCode "SSH key authentication preflight"
     $remoteConnectionVerified = $true
+
+    & ssh.exe @script:SshOptions $Target "sudo -n true"
+    $script:PiPasswordlessSudo = $LASTEXITCODE -eq 0
 
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -448,7 +474,7 @@ try {
     }
     $deployCommand += @(
         "sudo install -o root -g root -m 0644 $(Quote-Remote "$RemoteRoot/systemd/orion.service") $(Quote-Remote "/etc/systemd/system/$Service")",
-        "printf %s $(Quote-Remote $modelEnvironmentBase64) | base64 -d | sudo python3 - $(Quote-Remote "/etc/orion/orion.env") $(Quote-Remote $remoteModel) $(Quote-Remote $legacyRemoteModel) $(Quote-Remote $RemoteLlamaServer) $(Quote-Remote $RemoteModelRoot)",
+        "printf %s $(Quote-Remote $modelEnvironmentBase64) | base64 -d | sudo python3 - $(Quote-Remote "/etc/orion/orion.env") $(Quote-Remote $remoteModel) $(Quote-Remote $legacyRemoteModel) $(Quote-Remote $RemoteLlamaServer) $(Quote-Remote $RemoteModelRoot) $(Quote-Remote $onlineToolsValue)",
         "sudo -u orion-service env HOME=$testHomeQuoted ORION_DATABASE_PATH=$databaseQuoted PYTHONPATH=$(Quote-Remote "$RemoteRoot/src") $pythonQuoted -m pytest -p no:cacheprovider -q $(Quote-Remote "$RemoteRoot/tests")",
         "sudo systemctl daemon-reload",
         "sudo systemctl enable $serviceQuoted"

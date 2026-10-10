@@ -74,7 +74,7 @@ class Settings:
     reminder_poll_interval: float = 5.0
     searxng_base_url: str = ""
     searxng_allowed_hosts: tuple[str, ...] = ()
-    online_tools_enabled: bool = False
+    online_tools_enabled: bool = True
     voice_profile: str = "legacy"
     stt_backend: str = "vosk"
     stt_language: str = "en"
@@ -253,7 +253,7 @@ class Settings:
                 if host.strip()
             ),
             audio_device=audio_device,
-            online_tools_enabled=os.getenv("ORION_ONLINE_TOOLS_ENABLED", "false").lower()
+            online_tools_enabled=os.getenv("ORION_ONLINE_TOOLS_ENABLED", "true").lower()
             in {"1", "true", "yes", "on"},
             voice_profile=voice_profile,
             stt_backend=stt_backend,

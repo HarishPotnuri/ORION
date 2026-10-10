@@ -358,7 +358,19 @@ Phase 14 is the production LLM runtime. First provision the pinned GGUF and `lla
 \.\scripts\deploy-pi.ps1 -Target orion@10.159.42.172 -SshIdentityFile "$HOME\.ssh\orion_pi_ed25519"
 # Override if ORION_DATABASE_PATH differs from /var/lib/orion/orion.sqlite3:
 \.\scripts\deploy-pi.ps1 -DatabasePath /custom/path/orion.sqlite3
+\.\scripts\deploy-pi.ps1 -EnableOnlineTools
 ```
+
+Weather, news, and web search are enabled by default and require Internet access,
+but no API keys: weather uses Open-Meteo, search uses
+`https://www.bing.com/search?format=rss`, and news uses
+`https://news.google.com/rss/search` (English, India edition). Results include
+source links; news also includes publication dates when supplied by the feed.
+Set `ORION_ONLINE_TOOLS_ENABLED=false` or deploy with `-DisableOnlineTools` for
+offline-only operation. Hugging Face/model downloads remain offline regardless.
+To replace the public RSS providers, set `ORION_SEARXNG_BASE_URL` to a working
+HTTPS SearXNG instance with JSON enabled and set `ORION_SEARXNG_ALLOWED_HOSTS`
+to its exact hostname. Public providers may impose rate limits or outages.
 
 Restart the Pi service without deploying:
 

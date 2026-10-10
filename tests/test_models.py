@@ -24,7 +24,11 @@ class ModelRegistryTests(unittest.TestCase):
     def test_registry_contains_requested_offline_inventory_ids(self):
         self.assertEqual(
             {key for key, spec in MODEL_REGISTRY.items() if spec.kind == "llm"},
-            {"qwen3.5-2b-q4", "qwen3.5-2b-q8", "qwen3-1.7b-q8", "phi4-mini-q4", "gemma4-e2b-q8"},
+            {"qwen3.5-2b-q4", "minicpm5-2b-q4", "qwen3.5-2b-q8", "qwen3-1.7b-q8", "phi4-mini-q4", "gemma4-e2b-q8"},
+        )
+        self.assertEqual(
+            resolve_model_path(Path("/depot"), "minicpm5-2b-q4"),
+            Path("/depot/LLM/MiniCPM5-2B-Q4_K_M.gguf"),
         )
         self.assertEqual(
             resolve_model_path(Path("/depot"), "qwen3.5-2b-q4"),

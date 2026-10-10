@@ -347,9 +347,16 @@ class WakeListenerInput:
                 self._control_cancel = self.control.cancel_event
                 turn_cancel = self._turn_cancel
                 control_cancel = self._control_cancel
+                control_token = self.control.generation
                 self._armed.set()
             try:
                 while not self.stop_event.is_set():
+                    if (
+                        turn_cancel.is_set()
+                        or control_cancel.is_set()
+                        or not self.control.allows(control_token)
+                    ):
+                        return ""
                     with self._turn_lock:
                         deadline = self._turn_deadline
                     remaining = deadline - time.monotonic()
@@ -392,6 +399,11 @@ class WakeListenerInput:
 
     def next_followup_utterance(self, timeout: float = 10.0) -> str:
         return self.next_utterance(timeout=timeout, followup=True)
+
+    def wait_until_unmuted(self) -> bool:
+        while not self.stop_event.is_set() and self.control.muted:
+            self.stop_event.wait(0.1)
+        return not self.stop_event.is_set()
 
     def _transcribe(self, pcm, *, cancel_event, timeout) -> str:
         text = self.transcriber.transcribe(

@@ -461,6 +461,8 @@ def _run_voice_loop(audio_input, orchestrator, speech_output, scheduler, stop_ev
                 if not transcript.strip():
                     if isinstance(audio_input, WakeListenerInput):
                         followup_active = False
+                        if audio_input.control.muted:
+                            audio_input.wait_until_unmuted()
                         continue
                     speech_output.speak("I didn't catch that. Please try again.")
                     continue

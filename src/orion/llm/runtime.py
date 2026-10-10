@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Sequence
 from collections.abc import Iterator
 from pathlib import Path
@@ -317,6 +318,57 @@ class LocalJsonTransport:
         timeout: float,
         policy: NetworkPolicy | None = None,
     ) -> dict[str, Any]:
+        data = self._get_factual_bytes(
+            url, params=params, allowed_hosts=allowed_hosts, timeout=timeout,
+            policy=policy, accept="application/json",
+        )
+        try:
+            result = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Factual lookup returned invalid JSON") from error
+        if not isinstance(result, dict):
+            raise RuntimeError("Factual lookup response must be a JSON object")
+        return result
+
+    def get_factual_rss(
+        self,
+        url: str,
+        *,
+        params: dict[str, str | int] | None,
+        allowed_hosts: set[str],
+        timeout: float,
+        policy: NetworkPolicy | None = None,
+    ) -> dict[str, Any]:
+        data = self._get_factual_bytes(
+            url, params=params, allowed_hosts=allowed_hosts, timeout=timeout,
+            policy=policy, accept="application/rss+xml, application/xml, text/xml",
+        )
+        try:
+            root = ElementTree.fromstring(data)
+        except ElementTree.ParseError as error:
+            raise RuntimeError("Factual lookup returned invalid RSS") from error
+        if root.tag != "rss" or root.find("channel") is None:
+            raise RuntimeError("Factual lookup response must be an RSS feed")
+        return {"results": [
+            {
+                "title": item.findtext("title", ""),
+                "content": item.findtext("description", ""),
+                "url": item.findtext("link", ""),
+                "published": item.findtext("pubDate", ""),
+            }
+            for item in root.findall("./channel/item")
+        ]}
+
+    def _get_factual_bytes(
+        self,
+        url: str,
+        *,
+        params: dict[str, str | int] | None,
+        allowed_hosts: set[str],
+        timeout: float,
+        policy: NetworkPolicy | None,
+        accept: str,
+    ) -> bytes:
         validator = policy or NetworkPolicy()
         validated_url = validator.validate_factual_url(url, allowed_hosts)
         if params:
@@ -324,7 +376,7 @@ class LocalJsonTransport:
             validated_url += separator + urlencode(params)
         request = urllib.request.Request(
             validated_url,
-            headers={"Accept": "application/json", "User-Agent": "ORION-local-assistant/0.1"},
+            headers={"Accept": accept, "User-Agent": "ORION-local-assistant/0.1"},
             method="GET",
         )
         try:
@@ -336,13 +388,7 @@ class LocalJsonTransport:
             raise RuntimeError(f"Factual lookup failed: {error.reason}") from error
         if len(data) > _MAX_RESPONSE_BYTES:
             raise RuntimeError("Factual lookup response exceeded the 1 MiB limit")
-        try:
-            result = json.loads(data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("Factual lookup returned invalid JSON") from error
-        if not isinstance(result, dict):
-            raise RuntimeError("Factual lookup response must be a JSON object")
-        return result
+        return data
 
 
 class LocalModelRuntime:

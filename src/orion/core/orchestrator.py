@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import threading
 import time
@@ -313,6 +314,12 @@ class RequestOrchestrator:
             observation = self._execute(tool_name, tool_arguments)
             if not observation.success:
                 return self._result(decision, observation.content, False)
+            if tool_name == "weather":
+                try:
+                    response = self._weather_response(request, observation.content)
+                except (ValueError, KeyError, TypeError, IndexError):
+                    return self._result(decision, "Weather lookup returned incomplete forecast data.", False)
+                return self._result(decision, response)
             agent_result = self.agent.run(
                 request,
                 initial_observations=[f"Allowlisted factual data from {tool_name}: {observation.content}"],
@@ -328,6 +335,32 @@ class RequestOrchestrator:
         if not capability.supported:
             return self._result(decision, capability.response, False)
         return self._run_planner(request, decision)
+
+    @staticmethod
+    def _weather_response(request: str, content: str) -> str:
+        forecast = json.loads(content)
+        location = forecast["location"]
+        tomorrow = "tomorrow" in request.casefold()
+        daily = forecast["daily"][1 if tomorrow else 0]
+        low = daily["temperature_2m_min"]
+        high = daily["temperature_2m_max"]
+        unit = forecast.get("daily_units", {}).get("temperature_2m_max", "")
+        unit = "degrees Celsius" if unit == "\u00b0C" else "degrees Fahrenheit" if unit == "\u00b0F" else unit
+        if tomorrow:
+            response = f"Tomorrow in {location}, the forecast low is {low:g} and the high is {high:g} {unit}."
+        else:
+            current = forecast["current"]
+            temperature = current["temperature_2m"]
+            response = (
+                f"In {location}, it is {temperature:g} {unit} as of {current['time'].replace('T', ' ')} "
+                f"{forecast.get('timezone', '')}. Today's low is {low:g} and the high is {high:g} {unit}."
+            )
+            if current.get("apparent_temperature") is not None:
+                response += f" It feels like {current['apparent_temperature']:g} {unit}."
+        probability = daily.get("precipitation_probability_max")
+        if probability is not None:
+            response += f" The chance of precipitation is {probability:g} percent."
+        return response + " Source: Open-Meteo."
 
     def _run_planner(self, request: str, decision: RouteDecision) -> RequestResult:
         agent, task_state, allowed_names = self._create_planner_agent(request)

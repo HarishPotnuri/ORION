@@ -53,6 +53,7 @@ THROTTLE_BITS = {
 MAX_LOG_LINES = 2000
 LLM_MODELS = (
     ("qwen3.5-2b-q4", "Qwen3.5 2B Q4_K_M", "LLM/Qwen3.5-2B-Q4_K_M.gguf"),
+    ("minicpm5-2b-q4", "MiniCPM5 2B Q4_K_M", "LLM/MiniCPM5-2B-Q4_K_M.gguf"),
     ("qwen3.5-2b-q8", "Qwen3.5 2B Q8_0", "LLM/Qwen3.5-2B-Q8_0.gguf"),
     ("qwen3-1.7b-q8", "Qwen3 1.7B Q8_0", "LLM/Qwen3-1.7B-Q8_0.gguf"),
     ("phi4-mini-q4", "Phi-4 mini Q4_K_M", "LLM/Phi-4-mini-instruct-Q4_K_M.gguf"),
@@ -278,7 +279,8 @@ class Monitor:
         threading.Thread(target=self.run_model_inventory, daemon=True).start()
 
     def run_model_inventory(self) -> None:
-        remote_command = f"find {shlex.quote(self.model_root)} -type f -printf '%P\\t%s\\n'"
+        llm_root = shlex.quote(f"{self.model_root}/LLM")
+        remote_command = f"find {llm_root} -type f -printf 'LLM/%P\\t%s\\n'"
         try:
             proc = spawn(ssh_base(self.target) + [remote_command])
             self.procs.append(proc)

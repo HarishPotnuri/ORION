@@ -544,6 +544,33 @@ def test_mute_invalidates_transcript_already_returned_but_not_claimed(harness):
     assert not harness.listener.claim_utterance()
 
 
+def test_mute_while_waiting_releases_consumer_and_unmute_accepts_new_turn(harness):
+    waiting_call = harness.request()
+    old_session = harness.source.next_session()
+
+    assert harness.control.set_muted(True)
+    assert old_session.closed.wait(WAIT)
+    assert waiting_call.result() == ""
+
+    assert not harness.control.set_muted(False)
+    new_session = harness.source.next_session()
+    next_call = harness.request()
+    voiced_turn(new_session)
+
+    assert next_call.result() == "recognized words"
+    assert harness.listener.claim_utterance()
+
+
+def test_wait_until_unmuted_blocks_without_spinning_and_exits_after_toggle(harness):
+    assert harness.control.set_muted(True)
+    waiting = BackgroundCall(harness.listener.wait_until_unmuted)
+    assert waiting.thread.is_alive()
+
+    assert not harness.control.set_muted(False)
+
+    assert waiting.result() is True
+
+
 def test_persisted_mute_starts_without_capture_timeout_does_not_stop_service(tmp_path):
     instance = ListenerHarness(tmp_path, muted=True)
     try:

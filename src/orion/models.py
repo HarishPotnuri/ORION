@@ -31,6 +31,7 @@ class ModelSpec:
 
 MODEL_SPECS = (
     ModelSpec("qwen3.5-2b-q4", "Qwen3.5 2B Q4_K_M", "llm", "LLM", "Qwen3.5-2B-Q4_K_M.gguf", "llama.cpp", "Q4_K_M", 4096, notes="Current benchmark target"),
+    ModelSpec("minicpm5-2b-q4", "MiniCPM5 2B Q4_K_M", "llm", "LLM", "MiniCPM5-2B-Q4_K_M.gguf", "llama.cpp", "Q4_K_M", 4096),
     ModelSpec("qwen3.5-2b-q8", "Qwen3.5 2B Q8_0", "llm", "LLM", "Qwen3.5-2B-Q8_0.gguf", "llama.cpp", "Q8_0", 4096),
     ModelSpec("qwen3-1.7b-q8", "Qwen3 1.7B Q8_0", "llm", "LLM", "Qwen3-1.7B-Q8_0.gguf", "llama.cpp", "Q8_0", 4096),
     ModelSpec("phi4-mini-q4", "Phi-4 mini instruct Q4_K_M", "llm", "LLM", "Phi-4-mini-instruct-Q4_K_M.gguf", "llama.cpp", "Q4_K_M", 4096),
